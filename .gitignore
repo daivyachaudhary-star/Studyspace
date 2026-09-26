@@ -1,0 +1,13 @@
+# Secrets — never commit these
+.streamlit/secrets.toml
+
+# Local databases — user data, not code
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.idea/
