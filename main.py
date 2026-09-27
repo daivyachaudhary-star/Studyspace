@@ -7,6 +7,8 @@ import base64
 import random
 import time
 import threading
+import smtplib
+from email.mime.text import MIMEText
 import requests
 import streamlit as st
 from google import genai
@@ -20,6 +22,8 @@ st.set_page_config(page_title="StudySpace", layout="wide")
 DB_NAME = "studyspace.db"
 ONESIGNAL_APP_ID = st.secrets.get("ONESIGNAL_APP_ID", "")
 ONESIGNAL_REST_KEY = st.secrets.get("ONESIGNAL_REST_KEY", "")
+EMAIL_ADDRESS = st.secrets.get("EMAIL_ADDRESS", "")
+EMAIL_PASSWORD = st.secrets.get("EMAIL_PASSWORD", "")
 
 
 TIER_LIMITS = {
@@ -170,6 +174,47 @@ def init_db():
    """)
 
 
+   cursor.execute("""
+       CREATE TABLE IF NOT EXISTS chat_sessions (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           email TEXT,
+           title TEXT,
+           created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+       )
+   """)
+
+
+   cursor.execute("""
+       CREATE TABLE IF NOT EXISTS chat_messages (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           session_id INTEGER,
+           role TEXT,
+           content TEXT,
+           image_data BLOB,
+           mime_type TEXT,
+           help_stage INTEGER,
+           original_prompt TEXT,
+           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+       )
+   """)
+
+
+   # Lets a student dismiss a single Test Alert / Homework banner from their
+   # home page (e.g. once they've prepared for the test or done the homework)
+   # without deleting the underlying test/assignment for anyone else.
+   cursor.execute("""
+       CREATE TABLE IF NOT EXISTS notification_dismissals (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           student_email TEXT,
+           notif_type TEXT,
+           ref_id INTEGER,
+           dismissed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+           UNIQUE(student_email, notif_type, ref_id)
+       )
+   """)
+
+
    def add_column_if_missing(table, column, col_type):
        cursor.execute(f"PRAGMA table_info({table})")
        existing_cols = [c[1] for c in cursor.fetchall()]
@@ -179,6 +224,11 @@ def init_db():
    add_column_if_missing("class_enrollment", "student_name", "TEXT DEFAULT ''")
    add_column_if_missing("class_enrollment", "status", "TEXT DEFAULT 'pending'")
 
+   # Older local databases were created before "email TEXT UNIQUE" was added to
+   # the CREATE TABLE statement below — CREATE TABLE IF NOT EXISTS never retrofits
+   # an existing table, so those DBs are missing the unique index that
+   # "ON CONFLICT(email)" in save_user_profile() depends on. Add it if absent.
+   cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_profile_email ON user_profile(email)")
 
    conn.commit()
    conn.close()
@@ -311,7 +361,30 @@ def generate_otp():
 
 
 def send_otp_email(to_email, otp_code):
-   return True
+   """Sends a real OTP email via Gmail SMTP. Returns True only if the send actually succeeded."""
+   if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
+       st.session_state["last_otp_error"] = (
+           "EMAIL_ADDRESS / EMAIL_PASSWORD are not set in secrets.toml — no email can be sent."
+       )
+       return False
+
+   try:
+       msg = MIMEText(
+           f"Your StudySpace verification code is: {otp_code}\n\n"
+           f"If you didn't request this, you can ignore this email."
+       )
+       msg["Subject"] = "Your StudySpace verification code"
+       msg["From"] = EMAIL_ADDRESS
+       msg["To"] = to_email
+
+       with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+           server.starttls()
+           server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+           server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+       return True
+   except Exception as e:
+       st.session_state["last_otp_error"] = f"Couldn't send the OTP email: {e}"
+       return False
 
 
 
@@ -480,6 +553,135 @@ def fetch_logs(email=None):
 
 
 
+# =========================================================
+# PERSISTED CHAT HISTORY ("RECENT CHATS")
+# =========================================================
+def create_chat_session(email, title):
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   clean_title = (title or "New chat").strip()[:80] or "New chat"
+   cursor.execute(
+       "INSERT INTO chat_sessions (email, title) VALUES (?, ?)",
+       (email.lower().strip(), clean_title),
+   )
+   session_id = cursor.lastrowid
+   conn.commit()
+   conn.close()
+   return session_id
+
+
+def touch_chat_session(session_id):
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+       (session_id,),
+   )
+   conn.commit()
+   conn.close()
+
+
+def save_chat_message(session_id, role, content, image_bytes=None, mime_type=None,
+                       help_stage=None, original_prompt=None):
+   if not session_id:
+       return
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       """
+       INSERT INTO chat_messages (session_id, role, content, image_data, mime_type, help_stage, original_prompt)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       """,
+       (session_id, role, content, image_bytes, mime_type, help_stage, original_prompt),
+   )
+   conn.commit()
+   conn.close()
+   touch_chat_session(session_id)
+
+
+def get_recent_chat_sessions(email, limit=10):
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       "SELECT id, title, updated_at FROM chat_sessions WHERE LOWER(email) = ? ORDER BY updated_at DESC LIMIT ?",
+       (email.lower().strip(), limit),
+   )
+   rows = cursor.fetchall()
+   conn.close()
+   return rows
+
+
+def get_chat_session_messages(session_id):
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       """
+       SELECT role, content, image_data, mime_type, help_stage, original_prompt
+       FROM chat_messages WHERE session_id = ? ORDER BY id ASC
+       """,
+       (session_id,),
+   )
+   rows = cursor.fetchall()
+   conn.close()
+
+   messages = []
+   for role, content, image_data, mime_type, help_stage, original_prompt in rows:
+       msg = {"role": role, "content": content}
+       if image_data:
+           msg["image_bytes"] = image_data
+       if mime_type:
+           msg["mime_type"] = mime_type
+       if help_stage is not None:
+           msg["help_stage"] = help_stage
+       if original_prompt:
+           msg["original_prompt"] = original_prompt
+       messages.append(msg)
+   return messages
+
+
+def delete_chat_session(session_id):
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+   cursor.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+   conn.commit()
+   conn.close()
+
+
+def start_new_chat_session(email, seed_messages, title=None):
+   """Creates a persisted chat session from a freshly-built messages list (already about
+   to be assigned to st.session_state['messages']), saves every message in it, marks the
+   new session as the active one, and returns its id."""
+   if not title:
+       for m in seed_messages:
+           if m.get("role") == "user" and m.get("content"):
+               title = m["content"]
+               break
+   if not title:
+       title = seed_messages[0]["content"] if seed_messages else "New chat"
+
+   session_id = create_chat_session(email, title)
+   for m in seed_messages:
+       save_chat_message(
+           session_id,
+           m.get("role", "user"),
+           m.get("content", ""),
+           image_bytes=m.get("image_bytes"),
+           mime_type=m.get("mime_type"),
+           help_stage=m.get("help_stage"),
+           original_prompt=m.get("original_prompt"),
+       )
+   st.session_state["current_chat_session_id"] = session_id
+   return session_id
+
+
+def resume_chat_session(session_id):
+   st.session_state["messages"] = get_chat_session_messages(session_id)
+   st.session_state["current_chat_session_id"] = session_id
+   st.session_state["page"] = "AI Tutor"
+   st.rerun()
+
+
 def fetch_quiz_results(email=None):
    conn = sqlite3.connect(DB_NAME)
    cursor = conn.cursor()
@@ -584,6 +786,46 @@ def check_and_notify_upcoming_tests(student_email):
    return upcoming
 
 
+def get_upcoming_tests_for_display(student_email):
+   """Every not-yet-passed test for this student's classes, minus any the
+   student has dismissed from their home page. Unlike check_and_notify_upcoming_tests
+   (which is one-shot, for firing the push notification), this is what actually
+   drives the home page banner, so it stays visible until dismissed."""
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   today_str = datetime.date.today().isoformat()
+   cursor.execute(
+       """
+       SELECT t.id, t.test_title, t.subject, t.topic, t.test_date
+       FROM class_tests t
+       JOIN class_enrollment e ON t.class_id = e.class_id
+       WHERE LOWER(e.student_email) = ? AND e.status = 'approved'
+       AND t.test_date >= ?
+       AND t.id NOT IN (
+           SELECT ref_id FROM notification_dismissals
+           WHERE LOWER(student_email) = ? AND notif_type = 'test'
+       )
+       ORDER BY t.test_date ASC
+       """,
+       (student_email.lower().strip(), today_str, student_email.lower().strip()),
+   )
+   rows = cursor.fetchall()
+   conn.close()
+   return rows
+
+
+def dismiss_notification(student_email, notif_type, ref_id):
+   """Marks a single test/homework banner as dismissed for this student only."""
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       "INSERT OR IGNORE INTO notification_dismissals (student_email, notif_type, ref_id) VALUES (?, ?, ?)",
+       (student_email.lower().strip(), notif_type, ref_id),
+   )
+   conn.commit()
+   conn.close()
+
+
 
 
 # =========================================================
@@ -594,9 +836,19 @@ def generate_join_code():
 
 
 def create_class(teacher_email, class_name):
-   """Creates a class for this teacher and returns a fresh unique 6-digit join code."""
+   """Creates a class for this teacher and returns a fresh unique 6-digit join code.
+   Returns (ok, result) — result is the join code on success, or an error message on failure."""
    conn = sqlite3.connect(DB_NAME)
    cursor = conn.cursor()
+
+   cursor.execute(
+       "SELECT id FROM classes WHERE LOWER(teacher_email) = ? AND LOWER(class_name) = ?",
+       (teacher_email.lower().strip(), class_name.strip().lower()),
+   )
+   if cursor.fetchone():
+       conn.close()
+       return False, "A class with this name already exists."
+
    for _ in range(25):
        code = generate_join_code()
        try:
@@ -606,11 +858,11 @@ def create_class(teacher_email, class_name):
            )
            conn.commit()
            conn.close()
-           return code
+           return True, code
        except sqlite3.IntegrityError:
            continue
    conn.close()
-   return None
+   return False, "Couldn't generate a join code, try again."
 
 
 def get_teacher_classes(teacher_email):
@@ -708,6 +960,89 @@ def get_approved_students_for_class(class_id):
        (class_id,),
    )
    rows = [r[0] for r in cursor.fetchall()]
+   conn.close()
+   return rows
+
+
+def get_students_for_class(class_id):
+   """Returns (student_name, student_email) for every approved student in a class."""
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       "SELECT student_name, student_email FROM class_enrollment WHERE class_id = ? AND status = 'approved' ORDER BY student_name",
+       (class_id,),
+   )
+   rows = cursor.fetchall()
+   conn.close()
+   return rows
+
+
+def get_student_classes(student_email):
+   """Returns (class_id, class_name, teacher_email, join_code) for every class this student is approved into."""
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       """
+       SELECT c.id, c.class_name, c.teacher_email, c.join_code
+       FROM class_enrollment e
+       JOIN classes c ON e.class_id = c.id
+       WHERE LOWER(e.student_email) = ? AND e.status = 'approved'
+       ORDER BY c.class_name
+       """,
+       (student_email.lower().strip(),),
+   )
+   rows = cursor.fetchall()
+   conn.close()
+   return rows
+
+
+def get_class_homework(class_id):
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       "SELECT title, topic, due_date FROM assignments WHERE class_id = ? ORDER BY due_date DESC",
+       (class_id,),
+   )
+   rows = cursor.fetchall()
+   conn.close()
+   return rows
+
+
+def get_class_tests_for_class(class_id):
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       "SELECT test_title, subject, topic, test_date FROM class_tests WHERE class_id = ? ORDER BY test_date",
+       (class_id,),
+   )
+   rows = cursor.fetchall()
+   conn.close()
+   return rows
+
+
+def get_student_upcoming_homework(student_email):
+   """Returns (id, title, topic, due_date, class_name) for homework due today or later,
+   across every class this student is approved into, minus any the student has
+   dismissed (e.g. because they already did it) from their home page."""
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   today_str = datetime.date.today().isoformat()
+   cursor.execute(
+       """
+       SELECT a.id, a.title, a.topic, a.due_date, c.class_name
+       FROM assignments a
+       JOIN classes c ON a.class_id = c.id
+       JOIN class_enrollment e ON e.class_id = c.id
+       WHERE LOWER(e.student_email) = ? AND e.status = 'approved' AND a.due_date >= ?
+       AND a.id NOT IN (
+           SELECT ref_id FROM notification_dismissals
+           WHERE LOWER(student_email) = ? AND notif_type = 'homework'
+       )
+       ORDER BY a.due_date ASC
+       """,
+       (student_email.lower().strip(), today_str, student_email.lower().strip()),
+   )
+   rows = cursor.fetchall()
    conn.close()
    return rows
 
@@ -899,8 +1234,13 @@ def extract_and_store_topic_details(prompt, image_bytes, mime_type, user_email):
    client = genai.Client(api_key=api_key)
    extraction_prompt = (
        "Analyze this prompt/image and extract the academic metadata as JSON with keys: "
-       "'subject', 'topic', 'specific_area'. "
-       "Example JSON: {\"subject\": \"Physics\", \"topic\": \"Kinematics\", \"specific_area\": \"Projectile Motion Formulae\"}. "
+       "'subject', 'topic', 'specific_area', 'content_summary'. "
+       "'content_summary' must capture the ACTUAL problems/questions visible in the image or prompt "
+       "(list out the specific expressions, numbers, or question text as written), not a generic "
+       "description — this is what a future practice test will be modeled on. "
+       "Example JSON: {\"subject\": \"Physics\", \"topic\": \"Kinematics\", \"specific_area\": \"Projectile Motion Formulae\", "
+       "\"content_summary\": \"Worksheet has 3 problems: (1) find range for v=20m/s at 30deg, "
+       "(2) time of flight for h=50m drop, (3) max height for v=15m/s at 45deg.\"}. "
        "Return ONLY raw JSON, nothing else."
    )
    contents = (
@@ -929,7 +1269,7 @@ def extract_and_store_topic_details(prompt, image_bytes, mime_type, user_email):
                subject=data.get("subject", "General"),
                topic=data.get("topic", "Homework"),
                specific_area=data.get("specific_area", prompt[:50]),
-               raw_text=prompt,
+               raw_text=data.get("content_summary") or prompt,
            )
            break
        except Exception as e:
@@ -949,6 +1289,25 @@ def extract_and_store_topic_details(prompt, image_bytes, mime_type, user_email):
 
 
 
+CONFUSION_PHRASES = [
+   "dont get it", "don't get it", "not get it",
+   "dont understand", "don't understand",
+   "im confused", "i'm confused", "confused",
+   "no idea", "dont know", "don't know",
+   "still lost", "im lost", "i'm lost",
+   "explain again", "explain differently", "explain it differently",
+   "makes no sense", "doesnt make sense", "doesn't make sense",
+   "can you simplify", "simpler please", "im stuck", "i'm stuck",
+]
+
+
+def is_confused_message(prompt):
+   """Loosely detects 'I don't understand'-style replies so the tutor can step down
+   to a simpler explanation instead of repeating the same method-only answer."""
+   p = prompt.lower().strip()
+   return any(phrase in p for phrase in CONFUSION_PHRASES)
+
+
 def generate_ai_response(
        prompt,
        image_bytes=None,
@@ -957,6 +1316,7 @@ def generate_ai_response(
        user_tier="freemium",
        grade="",
        user_email="",
+       history=None,
 ):
    essay_keywords = [
        "write an essay",
@@ -1002,11 +1362,19 @@ def generate_ai_response(
    selected_model = "gemini-3.8-flash"
 
 
-   # NOTE: extract_and_store_topic_details() used to run here on every single
-   # message. It made its own separate Gemini call, silently doubling API
-   # usage against the same rate-limited quota as the actual tutor response
-   # below. Disabled to stop burning the free-tier RPM cap twice per message.
-   # extract_and_store_topic_details(prompt, image_bytes, mime_type, user_email)
+   # extract_and_store_topic_details() used to run here on EVERY message (text
+   # included), making its own separate Gemini call and doubling API usage
+   # against the same rate-limited quota as the actual tutor response below —
+   # so it was disabled outright. That silently broke "study memory" entirely:
+   # nothing was ever saved to knowledge_items, so generate_mock_test_from_memory
+   # always came back empty ("No study history found"), even right after a
+   # student uploaded a homework worksheet photo.
+   # Only re-run it when THIS turn actually has an image: that's the case that
+   # matters (capturing the worksheet's real content for later mock tests) and
+   # image uploads are far rarer than ordinary text follow-ups, so this adds
+   # roughly one extra call per worksheet upload rather than doubling every turn.
+   if image_bytes:
+       extract_and_store_topic_details(prompt, image_bytes, mime_type, user_email)
 
 
    client = genai.Client(api_key=api_key)
@@ -1042,14 +1410,45 @@ def generate_ai_response(
    config = types.GenerateContentConfig(
        system_instruction=system_instruction
    )
-   contents = (
-       [
-           types.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/png"),
-           prompt,
-       ]
-       if image_bytes
-       else prompt
-   )
+
+   # Build the full conversation as multi-turn `contents` when a message history is
+   # given, so the model actually sees earlier turns (including earlier uploaded
+   # images) instead of only ever seeing this one isolated message. Without this,
+   # every call was a fresh, context-free request — the model had no memory of
+   # anything said or shown earlier in the same chat.
+   if history:
+       contents = []
+       for msg in history:
+           role = "model" if msg.get("role") == "assistant" else "user"
+           parts = []
+           if msg.get("image_bytes"):
+               parts.append(
+                   types.Part.from_bytes(
+                       data=msg["image_bytes"],
+                       mime_type=msg.get("mime_type") or "image/png",
+                   )
+               )
+           if msg.get("content"):
+               parts.append(types.Part.from_text(text=msg["content"]))
+           if parts:
+               contents.append(types.Content(role=role, parts=parts))
+
+       current_parts = []
+       if image_bytes:
+           current_parts.append(
+               types.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/png")
+           )
+       current_parts.append(types.Part.from_text(text=prompt))
+       contents.append(types.Content(role="user", parts=current_parts))
+   else:
+       contents = (
+           [
+               types.Part.from_bytes(data=image_bytes, mime_type=mime_type or "image/png"),
+               prompt,
+           ]
+           if image_bytes
+           else prompt
+       )
 
 
    # Added Exponential Backoff Retry Loop to resolve 503 UNAVAILABLE errors
@@ -1085,13 +1484,18 @@ def generate_mock_test_from_memory(user_email, target_subject=None):
        return f"No study history found{' for ' + target_subject if target_subject else ''} yet. Upload a screenshot or ask a question to start building practice tests!"
 
 
-   memory_summary = "\n".join([f"- Subject: {s}, Topic: {t}, Details: {a}" for s, t, a, r, ts in stored_items[:10]])
+   memory_summary = "\n".join(
+       [f"- Subject: {s}, Topic: {t}, Details: {a}\n  Actual content seen: {r}" for s, t, a, r, ts in stored_items[:10]]
+   )
 
 
    prompt = (
        f"Based on the student's study topics and past uploaded assignments:\n{memory_summary}\n\n"
        f"Generate a targeted 5-question Mock Practice Test with step-by-step solutions and key summary review points "
-       f"specifically formatted to help them study and excel in their test."
+       f"specifically formatted to help them study and excel in their test. "
+       f"Wherever an entry above has 'Actual content seen', base your questions on those specific problems "
+       f"(same numbers/expressions/style where reasonable, or close variations of them) rather than inventing "
+       f"generic textbook questions on the topic."
    )
    return generate_ai_response(prompt, mode="full", user_email=user_email)
 
@@ -1321,6 +1725,15 @@ st.markdown(
   .test-alert-card {
       background: #fef2f2;
       border: 1px solid #fca5a5;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 20px;
+  }
+
+
+  .homework-alert-card {
+      background: #eff6ff;
+      border: 1px solid #93c5fd;
       border-radius: 12px;
       padding: 16px;
       margin-bottom: 20px;
@@ -1623,20 +2036,33 @@ def render_onboarding_wizard():
            if not st.session_state["email_verified"]:
                if not st.session_state["otp_sent"]:
                    if st.button(
-                           "Send Verification OTP", use_container_width=True
+                           "Send Verification OTP", use_container_width=True, key="btn_send_otp"
                    ):
                        if email_val.strip():
                            otp = generate_otp()
                            st.session_state["generated_otp"] = otp
                            if send_otp_email(email_val.strip(), otp):
                                st.session_state["otp_sent"] = True
+                               st.session_state["otp_email_confirmed"] = True
                                st.success(f"Code sent to {email_val}!")
                                st.rerun()
+                           else:
+                               st.session_state["otp_email_confirmed"] = False
+                               st.error(st.session_state.get("last_otp_error", "Couldn't send the OTP email."))
                else:
-                   user_code = st.text_input("Enter 6-digit OTP code:")
+                   code_col, tick_col = st.columns([5, 1], vertical_alignment="bottom")
+                   with code_col:
+                       user_code = st.text_input("Enter 6-digit OTP code:")
+                   with tick_col:
+                       if st.session_state.get("otp_email_confirmed"):
+                           st.markdown(
+                               "<div style='text-align:center; color:#16a34a; font-size:1.5rem; padding-bottom:0.5rem;'>&#10003;</div>",
+                               unsafe_allow_html=True,
+                           )
+                   st.caption("Didn't get an email? Check your spam/junk folder — it can take a minute to arrive.")
                    col_v, col_r = st.columns([1, 1])
                    with col_v:
-                       if st.button("Verify OTP", use_container_width=True):
+                       if st.button("Verify OTP", use_container_width=True, key="btn_verify_otp"):
                            if (
                                    user_code.strip()
                                    == st.session_state["generated_otp"]
@@ -1647,15 +2073,24 @@ def render_onboarding_wizard():
                            else:
                                st.error("Invalid OTP code. Please try again.")
                    with col_r:
-                       if st.button("Resend OTP", use_container_width=True):
+                       resend_clicked = st.button(
+                           "Resend OTP", use_container_width=True, key="btn_resend_otp"
+                       )
+                       if st.session_state.get("otp_email_confirmed"):
+                           st.caption(":green[✓ Sent]")
+                       if resend_clicked:
                            if email_val.strip():
                                new_otp = generate_otp()
                                st.session_state["generated_otp"] = new_otp
                                if send_otp_email(email_val.strip(), new_otp):
+                                   st.session_state["otp_email_confirmed"] = True
                                    st.success(
                                        f"A new code was sent to {email_val}!"
                                    )
                                    st.rerun()
+                               else:
+                                   st.session_state["otp_email_confirmed"] = False
+                                   st.error(st.session_state.get("last_otp_error", "Couldn't send the OTP email."))
            else:
                st.success("Email Verified")
 
@@ -1689,7 +2124,11 @@ def render_onboarding_wizard():
                "Computer Science",
                "English",
                "History",
+               "Geography",
+               "Civics",
                "Economics",
+               "Environmental Science",
+               "Foreign Language",
            ]
            selected_subjects = st.multiselect(
                "Select Subjects:", options=subject_options
@@ -1747,19 +2186,19 @@ def render_onboarding_wizard():
 
        btn_col1, btn_col2 = st.columns([1, 1])
        with btn_col1:
-           if step > 1 and st.button("Back", use_container_width=True):
+           if step > 1 and st.button("Back", use_container_width=True, key="btn_wizard_back"):
                st.session_state["wizard_step"] -= 1
                st.rerun()
        with btn_col2:
            if step < total_steps:
-               if st.button("Next", use_container_width=True):
+               if st.button("Next", use_container_width=True, key="btn_wizard_next"):
                    if step == 1 and not st.session_state["email_verified"]:
                        st.error("Please verify your email address first!")
                    else:
                        st.session_state["wizard_step"] += 1
                        st.rerun()
            else:
-               if st.button("Complete Setup", use_container_width=True):
+               if st.button("Complete Setup", use_container_width=True, key="btn_wizard_complete"):
                    fd = st.session_state["form_data"]
                    user_e = fd["email"].strip().lower()
                    save_user_profile(
@@ -1789,11 +2228,11 @@ def render_create_class_dialog(teacher_email):
        new_class_name = st.text_input("Class name (e.g. Grade 9 Physics)")
        if st.form_submit_button("Create Class"):
            if new_class_name.strip():
-               code = create_class(teacher_email, new_class_name.strip())
-               if code:
-                   st.success(f"Class '{new_class_name.strip()}' created! Join code: {code}")
+               ok, result = create_class(teacher_email, new_class_name.strip())
+               if ok:
+                   st.success(f"Class '{new_class_name.strip()}' created! Join code: {result}")
                else:
-                   st.error("Couldn't generate a join code, try again.")
+                   st.error(result)
            else:
                st.warning("Enter a class name first.")
 
@@ -1885,6 +2324,113 @@ def render_schedule_reminder_dialog(user_email):
                st.success(f"Reminder set for {due_dt.strftime('%b %d, %I:%M %p')}.")
 
 
+@st.dialog("Your Classes")
+def render_classes_dialog(teacher_email):
+   teacher_classes = get_teacher_classes(teacher_email)
+
+   if not teacher_classes:
+       st.info("You haven't created any classes yet. Use '+ Create New Class' first.")
+       return
+
+   selected_id = st.session_state.get("classes_dlg_selected_id")
+   selected_class = next((c for c in teacher_classes if c[0] == selected_id), None)
+
+   if not selected_class:
+       st.caption("Click a class to manage it.")
+       for c_id, c_name, c_code in teacher_classes:
+           if st.button(f"{c_name}  —  join code {c_code}", use_container_width=True, key=f"cls_pick_{c_id}"):
+               st.session_state["classes_dlg_selected_id"] = c_id
+               st.session_state["classes_dlg_action"] = None
+               st.rerun()
+       return
+
+   c_id, c_name, c_code = selected_class
+   st.markdown(f"**{c_name}** — join code `{c_code}`")
+   if st.button("< Back to all classes", key="cls_back_btn"):
+       st.session_state["classes_dlg_selected_id"] = None
+       st.session_state["classes_dlg_action"] = None
+       st.rerun()
+
+   st.write("---")
+
+   action = st.session_state.get("classes_dlg_action")
+
+   ac1, ac2, ac3 = st.columns(3, gap="small")
+   with ac1:
+       if st.button("Post Homework", use_container_width=True, key=f"cls_act_hw_{c_id}"):
+           st.session_state["classes_dlg_action"] = "hw"
+           st.rerun()
+   with ac2:
+       if st.button("Add a reminder", use_container_width=True, key=f"cls_act_rem_{c_id}"):
+           st.session_state["classes_dlg_action"] = "rem"
+           st.rerun()
+   with ac3:
+       if st.button("Show students", use_container_width=True, key=f"cls_act_stu_{c_id}"):
+           st.session_state["classes_dlg_action"] = "stu"
+           st.rerun()
+
+   st.write("")
+
+   if action == "hw":
+       with st.form(f"cls_hw_form_{c_id}"):
+           hw_title = st.text_input("Homework Title (e.g. Worksheet 4)")
+           hw_topic = st.text_input("Topic (e.g. Chapter 3 Practice Problems)")
+           hw_due = st.date_input(
+               "Due Date", datetime.date.today() + datetime.timedelta(days=1), key=f"cls_hw_due_{c_id}"
+           )
+           if st.form_submit_button("Post Homework & Notify Students"):
+               if hw_title.strip():
+                   create_assignment(c_id, c_name, hw_title, hw_topic, hw_due.isoformat())
+                   st.success(f"Homework '{hw_title}' posted! AI notified enrolled students.")
+               else:
+                   st.warning("Give the homework a title first.")
+
+   elif action == "rem":
+       with st.form(f"cls_rem_form_{c_id}"):
+           t_title = st.text_input("Test Title (e.g. Midterm Chapter 3)")
+           t_subject = st.text_input("Subject (e.g. Physics)")
+           t_topic = st.text_input("Topic (e.g. Kinematics)")
+           t_date = st.date_input(
+               "Test Date", datetime.date.today() + datetime.timedelta(days=2), key=f"cls_rem_date_{c_id}"
+           )
+           if st.form_submit_button("Schedule Test & Notify Students"):
+               if t_title.strip():
+                   add_class_test(c_id, t_title, t_subject, t_topic, t_date.isoformat())
+                   st.success(f"Test '{t_title}' scheduled! AI will notify enrolled students 3 days prior.")
+               else:
+                   st.warning("Give the test a title first.")
+
+   elif action == "stu":
+       students = get_students_for_class(c_id)
+       if not students:
+           st.caption("No students have been approved into this class yet.")
+       else:
+           st.caption(f"{len(students)} student(s) enrolled:")
+           for s_name, s_email in students:
+               st.markdown(f"- **{s_name or s_email}** ({s_email})")
+
+
+@st.dialog("Join Requests")
+def render_join_requests_dialog(teacher_email):
+   pending = get_pending_join_requests(teacher_email)
+   if not pending:
+       st.info("No pending join requests right now.")
+       return
+
+   for req_id, req_email, req_name, req_class_name in pending:
+       with st.container(border=True):
+           st.markdown(f"**{req_name or req_email}** wants to join **'{req_class_name}'**")
+           jc1, jc2 = st.columns(2)
+           with jc1:
+               if st.button("Allow", key=f"jr_allow_{req_id}", use_container_width=True):
+                   update_join_request_status(req_id, "approved")
+                   st.rerun()
+           with jc2:
+               if st.button("Decline", key=f"jr_decline_{req_id}", use_container_width=True):
+                   update_join_request_status(req_id, "declined")
+                   st.rerun()
+
+
 def render_teacher_home_page(profile):
    user_name = profile["name"] if profile else "Teacher"
    teacher_email = profile["email"] if profile else ""
@@ -1967,62 +2513,56 @@ def render_teacher_home_page(profile):
                render_add_reminder_dialog(teacher_email)
 
 
-   st.write("")
-   st.subheader("Ask AI Tutor")
-
-
-   chat_input_data = st.chat_input(
-       "Enter a subject, topic, or drop a screenshot here...",
-       accept_file=True,
-       file_type=["png", "jpg", "jpeg", "webp"],
-   )
-
-
-   if chat_input_data:
-       prompt = chat_input_data["text"] or "Please analyze this image."
-       uploaded_files = chat_input_data["files"]
-
-
-       image_bytes = None
-       mime_type = None
-
-
-       if uploaded_files:
-           file = uploaded_files[0]
-           image_bytes = file.getvalue()
-           mime_type = file.type
-
-
-       log_session(prompt, teacher_email)
-       tier = profile.get("tier", "freemium") if profile else "freemium"
-       reply = generate_ai_response(
-           prompt,
-           image_bytes=image_bytes,
-           mime_type=mime_type,
-           mode="full",
-           user_tier=tier,
-           user_email=teacher_email,
-       )
-
-
-       st.session_state["messages"] = [
-           {"role": "user", "content": prompt, "image_bytes": image_bytes},
-           {
-               "role": "assistant",
-               "content": reply,
-               "help_stage": 3,
-               "original_prompt": prompt,
-           },
-       ]
-       st.session_state["page"] = "AI Tutor"
-       st.rerun()
-
-
-
 
 # =========================================================
 # STUDENT HOME PAGE (WITH TEST NOTIFICATION BANNERS)
 # =========================================================
+@st.dialog("Your Classes")
+def render_student_classes_dialog(student_email):
+   student_classes = get_student_classes(student_email)
+
+   if not student_classes:
+       st.info("You're not enrolled in any classes yet. Use '+ Join Class' to request to join one.")
+       return
+
+   selected_id = st.session_state.get("student_classes_dlg_selected_id")
+   selected_class = next((c for c in student_classes if c[0] == selected_id), None)
+
+   if not selected_class:
+       st.caption("Click a class to see its homework and tests.")
+       for c_id, c_name, c_teacher_email, c_code in student_classes:
+           if st.button(f"{c_name}  —  {c_teacher_email}", use_container_width=True, key=f"stu_cls_pick_{c_id}"):
+               st.session_state["student_classes_dlg_selected_id"] = c_id
+               st.rerun()
+       return
+
+   c_id, c_name, c_teacher_email, c_code = selected_class
+   st.markdown(f"**{c_name}**")
+   st.caption(f"Teacher: {c_teacher_email}")
+   if st.button("< Back to all classes", key="stu_cls_back_btn"):
+       st.session_state["student_classes_dlg_selected_id"] = None
+       st.rerun()
+
+   st.write("---")
+
+   st.markdown("##### Homework")
+   homework = get_class_homework(c_id)
+   if not homework:
+       st.caption("No homework posted yet.")
+   else:
+       for hw_title, hw_topic, hw_due in homework:
+           st.markdown(f"- **{hw_title}** — {hw_topic} (due {hw_due})")
+
+   st.write("")
+   st.markdown("##### Upcoming Tests")
+   tests = get_class_tests_for_class(c_id)
+   if not tests:
+       st.caption("No tests scheduled yet.")
+   else:
+       for t_title, t_subject, t_topic, t_date in tests:
+           st.markdown(f"- **{t_title}** — {t_subject} / {t_topic} ({t_date})")
+
+
 def render_home_page(profile):
    if profile and profile.get("role") == "teacher":
        render_teacher_home_page(profile)
@@ -2054,26 +2594,70 @@ def render_home_page(profile):
            render_upgrade_dialog(profile)
 
 
-   upcoming_tests = check_and_notify_upcoming_tests(user_email)
+   check_and_notify_upcoming_tests(user_email)  # fires the one-time push notification only
+   upcoming_tests = get_upcoming_tests_for_display(user_email)
    if upcoming_tests:
        for t_id, title, subj, top, t_date in upcoming_tests:
-           st.markdown(
-               f"""
-               <div class="test-alert-card">
-                   <h4 style="margin:0; color: #991b1b;">Upcoming Test Alert: {title}</h4>
-                   <p style="margin:4px 0 0 0; color: #7f1d1d;"><b>Subject:</b> {subj} | <b>Topic:</b> {top} | <b>Date:</b> {t_date}</p>
-               </div>
-               """,
-               unsafe_allow_html=True,
-           )
-           if st.button(f"Generate Mock Test & Notes for {top}", key=f"gen_mock_{t_id}"):
-               with st.spinner("Analyzing stored topic history and generating custom mock test..."):
-                   mock_res = generate_mock_test_from_memory(user_email, target_subject=top)
+           test_card_col, test_btn_col = st.columns([5, 1.3], vertical_alignment="center")
+           with test_card_col:
+               st.markdown(
+                   f"""
+                   <div class="test-alert-card">
+                       <h4 style="margin:0; color: #991b1b;">Upcoming Test Alert: {title}</h4>
+                       <p style="margin:4px 0 0 0; color: #7f1d1d;"><b>Subject:</b> {subj} | <b>Topic:</b> {top} | <b>Date:</b> {t_date}</p>
+                   </div>
+                   """,
+                   unsafe_allow_html=True,
+               )
+           with test_btn_col:
+               if st.button(f"Generate Mock Test & Notes for {top}", use_container_width=True, key=f"gen_mock_{t_id}"):
+                   with st.spinner("Analyzing stored topic history and generating custom mock test..."):
+                       mock_res = generate_mock_test_from_memory(user_email, target_subject=top)
+                       st.session_state["messages"] = [
+                           {"role": "user", "content": f"Generate mock test for upcoming {subj} test on {top}."},
+                           {"role": "assistant", "content": mock_res, "help_stage": 3}
+                       ]
+                       start_new_chat_session(user_email, st.session_state["messages"])
+                       st.session_state["page"] = "AI Tutor"
+                       st.rerun()
+               if st.button("✓ Already prepared, dismiss", use_container_width=True, key=f"dismiss_test_{t_id}"):
+                   dismiss_notification(user_email, "test", t_id)
+                   st.rerun()
+
+
+   upcoming_homework = get_student_upcoming_homework(user_email)
+   if upcoming_homework:
+       for hw_idx, (hw_id, hw_title, hw_topic, hw_due, hw_class_name) in enumerate(upcoming_homework):
+           hw_card_col, hw_btn_col = st.columns([5, 1.3], vertical_alignment="center")
+           with hw_card_col:
+               st.markdown(
+                   f"""
+                   <div class="homework-alert-card">
+                       <h4 style="margin:0; color: #1e3a8a;">Homework: {hw_title}</h4>
+                       <p style="margin:4px 0 0 0; color: #1e40af;"><b>Class:</b> {hw_class_name} | <b>Topic:</b> {hw_topic} | <b>Due:</b> {hw_due}</p>
+                   </div>
+                   """,
+                   unsafe_allow_html=True,
+               )
+           with hw_btn_col:
+               if st.button("Want help with this?", use_container_width=True, key=f"hw_help_btn_{hw_idx}"):
                    st.session_state["messages"] = [
-                       {"role": "user", "content": f"Generate mock test for upcoming {subj} test on {top}."},
-                       {"role": "assistant", "content": mock_res, "help_stage": 3}
+                       {
+                           "role": "assistant",
+                           "content": (
+                               f"Sure! Upload a photo of the worksheet or problem for **'{hw_title}'** "
+                               f"({hw_class_name} — {hw_topic}) using the box below, and I'll walk you "
+                               f"through it step by step."
+                           ),
+                       }
                    ]
+                   start_new_chat_session(
+                       user_email, st.session_state["messages"], title=f"Help with: {hw_title}"
+                   )
                    st.session_state["page"] = "AI Tutor"
+                   st.rerun()
+               if st.button("✓ Done, dismiss", use_container_width=True, key=f"dismiss_hw_{hw_id}"):
+                   dismiss_notification(user_email, "homework", hw_id)
                    st.rerun()
 
 
@@ -2103,67 +2687,6 @@ def render_home_page(profile):
    with sw2:
        if st.button("+ Join Class", use_container_width=True, key="btn_join_class_widget"):
            render_join_class_dialog(user_email, user_name)
-
-
-   st.write("")
-   st.subheader("Ask AI Tutor")
-
-
-   chat_input_data = st.chat_input(
-       "Enter a subject, topic, or drop a screenshot here...",
-       accept_file=True,
-       file_type=["png", "jpg", "jpeg", "webp"],
-   )
-
-
-   if chat_input_data:
-       prompt = chat_input_data["text"] or "Please analyze this image."
-       uploaded_files = chat_input_data["files"]
-
-
-       image_bytes = None
-       mime_type = None
-
-
-       if uploaded_files:
-           file = uploaded_files[0]
-           image_bytes = file.getvalue()
-           mime_type = file.type
-
-
-       log_session(prompt, user_email)
-       tier = profile.get("tier", "freemium") if profile else "freemium"
-       grade = profile.get("grade", "") if profile else ""
-       reply = generate_ai_response(
-           prompt,
-           image_bytes=image_bytes,
-           mime_type=mime_type,
-           mode="method",
-           user_tier=tier,
-           grade=grade,
-           user_email=user_email,
-       )
-
-
-       help_stage = 1
-       if reply.startswith(
-               "It is against my policy to write the entire essay for you"
-       ):
-           help_stage = 3
-
-
-       st.session_state["messages"] = [
-           {"role": "user", "content": prompt, "image_bytes": image_bytes},
-           {
-               "role": "assistant",
-               "content": reply,
-               "help_stage": help_stage,
-               "original_prompt": prompt,
-           },
-       ]
-       st.session_state["page"] = "AI Tutor"
-       st.rerun()
-
 
 
 
@@ -2239,7 +2762,16 @@ def render_tutor(profile):
                "role": "user",
                "content": prompt,
                "image_bytes": image_bytes,
+               "mime_type": mime_type,
            }
+       )
+
+
+       if not st.session_state.get("current_chat_session_id"):
+           st.session_state["current_chat_session_id"] = create_chat_session(user_email, prompt)
+       save_chat_message(
+           st.session_state["current_chat_session_id"],
+           "user", prompt, image_bytes=image_bytes, mime_type=mime_type,
        )
 
 
@@ -2249,16 +2781,34 @@ def render_tutor(profile):
            st.markdown(prompt)
 
 
+       # 3-step tutor rule: step 1 = method only, step 2 = a hint with a similar
+       # worked example (triggered when the student says they're confused), step 3 =
+       # the full walkthrough (triggered if they're still confused after the hint).
+       last_help_stage = 1
+       for prior_msg in reversed(st.session_state.messages[:-1]):
+           if prior_msg.get("role") == "assistant" and "help_stage" in prior_msg:
+               last_help_stage = prior_msg["help_stage"]
+               break
+
+       if is_confused_message(prompt):
+           next_help_stage = min(last_help_stage + 1, 3)
+       else:
+           next_help_stage = 1
+
+       stage_to_mode = {1: "method", 2: "hint", 3: "full"}
+       chosen_mode = stage_to_mode[next_help_stage]
+
        with st.chat_message("assistant"):
            with st.spinner("Analyzing screenshot and thinking..."):
                reply = generate_ai_response(
                    prompt,
                    image_bytes=image_bytes,
                    mime_type=mime_type,
-                   mode="method",
+                   mode=chosen_mode,
                    user_tier=user_tier,
                    grade=user_grade,
                    user_email=user_email,
+                   history=st.session_state.messages[:-1],
                )
 
 
@@ -2266,9 +2816,13 @@ def render_tutor(profile):
            {
                "role": "assistant",
                "content": reply,
-               "help_stage": 1,
+               "help_stage": next_help_stage,
                "original_prompt": prompt,
            }
+       )
+       save_chat_message(
+           st.session_state["current_chat_session_id"],
+           "assistant", reply, help_stage=next_help_stage, original_prompt=prompt,
        )
        st.rerun()
 
@@ -2322,6 +2876,7 @@ def main():
            st.session_state["wizard_step"] = 1
            st.session_state["email_verified"] = False
            st.session_state["otp_sent"] = False
+           st.session_state["otp_email_confirmed"] = False
            st.session_state["form_data"] = {
                "name": "",
                "email": "",
@@ -2390,6 +2945,7 @@ def main():
 
        if st.button("New Chat", use_container_width=True):
            st.session_state["messages"] = []
+           st.session_state["current_chat_session_id"] = None
            st.session_state["page"] = "AI Tutor"
            st.rerun()
 
@@ -2423,6 +2979,7 @@ def main():
                            st.session_state["messages"] = [
                                {"role": "user", "content": topic}
                            ]
+                           start_new_chat_session(user_email, st.session_state["messages"])
                            st.session_state["page"] = "AI Tutor"
                            st.rerun()
                else:
@@ -2476,6 +3033,7 @@ def main():
                                {"role": "user", "content": f"Study for a test: {subject_query}"},
                                {"role": "assistant", "content": mock_res, "help_stage": 3}
                            ]
+                           start_new_chat_session(user_email, st.session_state["messages"])
                            st.session_state["page"] = "AI Tutor"
                            st.session_state["show_test_prep"] = False
                            st.rerun()
@@ -2495,6 +3053,21 @@ def main():
                    unsafe_allow_html=True,
                )
 
+
+       # SIDEBAR "CLASSES" WIDGET (TEACHERS: + REQUESTS. STUDENTS: THEIR OWN CLASSES.)
+       if active_profile.get("role", "student") == "teacher":
+           pending_request_count = len(get_pending_join_requests(user_email))
+           requests_label = (
+               f"Requests ({pending_request_count})" if pending_request_count else "Requests"
+           )
+           if st.button(requests_label, use_container_width=True, key="btn_show_requests"):
+               render_join_requests_dialog(user_email)
+
+           if st.button("Classes", use_container_width=True, key="btn_show_classes"):
+               render_classes_dialog(user_email)
+       else:
+           if st.button("Classes", use_container_width=True, key="btn_show_student_classes"):
+               render_student_classes_dialog(user_email)
 
        # SIDEBAR "SCHEDULED" SECTION (PERSONAL REMINDERS)
        if st.button("Scheduled", use_container_width=True, key="btn_show_scheduled"):
@@ -2556,6 +3129,28 @@ def main():
                key="sidebar_upgrade_btn",
        ):
            render_upgrade_dialog(active_profile)
+
+
+       st.write("---")
+
+
+       # =========================================================
+       # RECENT CHATS (persisted, resumable conversation history)
+       # =========================================================
+       st.caption("RECENT CHATS")
+       recent_sessions = get_recent_chat_sessions(user_email, limit=8)
+       if recent_sessions:
+           for sess_id, sess_title, sess_updated in recent_sessions:
+               display_title = sess_title if len(sess_title) <= 30 else sess_title[:30] + "..."
+               is_active = st.session_state.get("current_chat_session_id") == sess_id
+               if st.button(
+                       ("• " if is_active else "") + display_title,
+                       use_container_width=True,
+                       key=f"recent_chat_{sess_id}",
+               ):
+                   resume_chat_session(sess_id)
+       else:
+           st.caption("No past chats yet.")
 
 
        st.write("---")
