@@ -13,6 +13,7 @@ import requests
 import streamlit as st
 from google import genai
 from google.genai import types
+from streamlit_autorefresh import st_autorefresh
 
 
 st.set_page_config(page_title="StudySpace", layout="wide")
@@ -2522,6 +2523,34 @@ def render_teacher_home_page(profile):
                        st.rerun()
 
 
+   # Same in-app due-soon banner as the student home page — teachers create
+   # reminders too (render_add_reminder_dialog), through the same reminders
+   # table, so they need the same live alert.
+   teacher_due_soon = get_due_soon_reminders(teacher_email)
+   if teacher_due_soon:
+       for rem_id, rem_title, rem_due, minutes_left in teacher_due_soon:
+           try:
+               rem_due_display = datetime.datetime.fromisoformat(rem_due).strftime("%I:%M %p")
+           except ValueError:
+               rem_due_display = rem_due
+           when_text = "Starting now" if minutes_left <= 0 else f"Starting in about {int(round(minutes_left))} minutes"
+           t_rem_card_col, t_rem_btn_col = st.columns([5, 1.3], vertical_alignment="center")
+           with t_rem_card_col:
+               st.markdown(
+                   f"""
+                   <div class="reminder-alert-card">
+                       <h4 style="margin:0; color: #92400e;">Reminder: {rem_title}</h4>
+                       <p style="margin:4px 0 0 0; color: #b45309;"><b>{when_text}</b> — {rem_due_display}</p>
+                   </div>
+                   """,
+                   unsafe_allow_html=True,
+               )
+           with t_rem_btn_col:
+               if st.button("✓ Got it, dismiss", use_container_width=True, key=f"dismiss_rem_teacher_{rem_id}"):
+                   dismiss_notification(teacher_email, "reminder", rem_id)
+                   st.rerun()
+
+
    m1, m2, m3 = st.columns(3)
    with m1:
        st.markdown(
@@ -2613,6 +2642,12 @@ def render_student_classes_dialog(student_email):
 
 
 def render_home_page(profile):
+   # Re-runs this page every 30s so the due-soon reminder banner can appear
+   # on its own, without the student/teacher needing to click anything first.
+   # Scoped to the home page only (not the whole app) so it never interrupts
+   # someone mid-chat on the AI Tutor page.
+   st_autorefresh(interval=30_000, key="home_due_soon_autorefresh")
+
    if profile and profile.get("role") == "teacher":
        render_teacher_home_page(profile)
        return

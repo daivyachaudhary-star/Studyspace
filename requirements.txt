@@ -1,3 +1,4 @@
 streamlit==1.63.0
 google-genai==2.25.0
 requests==2.34.2
+streamlit-autorefresh==1.0.1
