@@ -1119,6 +1119,42 @@ def get_upcoming_reminders(user_email):
    return rows
 
 
+def get_due_soon_reminders(user_email):
+   """Reminders due within the next 10 minutes (or up to 15 minutes overdue),
+   for the in-app alert banner on the home page. Deliberately NOT push-based:
+   this is a live query, re-run every time the page loads, mirroring the same
+   dismiss-table pattern get_upcoming_tests_for_display already uses for test
+   and homework alerts. Replaces the old OneSignal-push reminder path, which
+   depended on a browser permission prompt that was never confirmed to work."""
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       """
+       SELECT id, title, due_at FROM reminders
+       WHERE LOWER(user_email) = ?
+       AND id NOT IN (
+           SELECT ref_id FROM notification_dismissals
+           WHERE LOWER(student_email) = ? AND notif_type = 'reminder'
+       )
+       """,
+       (user_email.lower().strip(), user_email.lower().strip()),
+   )
+   rows = cursor.fetchall()
+   conn.close()
+
+   now = datetime.datetime.now()
+   due_soon = []
+   for r_id, title, due_at in rows:
+       try:
+           due_dt = datetime.datetime.fromisoformat(due_at)
+       except ValueError:
+           continue
+       minutes_left = (due_dt - now).total_seconds() / 60
+       if -15 <= minutes_left <= 10:
+           due_soon.append((r_id, title, due_at, minutes_left))
+   return due_soon
+
+
 def delete_reminder(reminder_id):
    conn = sqlite3.connect(DB_NAME)
    cursor = conn.cursor()
@@ -1504,7 +1540,11 @@ def generate_mock_test_from_memory(user_email, target_subject=None):
 
 # INITIALIZE APPLICATION COMPONENTS
 init_db()
-start_reminder_scheduler()
+# Superseded by the in-app due-soon banner (get_due_soon_reminders, used in
+# render_home_page): that's a live query on page load, so this background
+# push-based thread no longer needs to run. Left defined, not deleted, in
+# case OneSignal push is revisited later.
+# start_reminder_scheduler()
 
 
 if "active_email" not in st.session_state:
@@ -1734,6 +1774,15 @@ st.markdown(
   .homework-alert-card {
       background: #eff6ff;
       border: 1px solid #93c5fd;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 20px;
+  }
+
+
+  .reminder-alert-card {
+      background: #fffbeb;
+      border: 1px solid #fcd34d;
       border-radius: 12px;
       padding: 16px;
       margin-bottom: 20px;
@@ -2661,6 +2710,39 @@ def render_home_page(profile):
                    st.rerun()
 
 
+   # In-app "due soon" banner for personal reminders (10 minutes out, re-shown
+   # until 5 minutes out, then gone after a 15-minute grace window) — replaces
+   # the old OneSignal push path with something that doesn't depend on a browser
+   # permission prompt. Works for both student and teacher reminders, since both
+   # go through the same create_reminder()/reminders table.
+   due_soon_reminders = get_due_soon_reminders(user_email)
+   if due_soon_reminders:
+       for rem_id, rem_title, rem_due, minutes_left in due_soon_reminders:
+           try:
+               rem_due_display = datetime.datetime.fromisoformat(rem_due).strftime("%I:%M %p")
+           except ValueError:
+               rem_due_display = rem_due
+           if minutes_left <= 0:
+               when_text = "Starting now"
+           else:
+               when_text = f"Starting in about {int(round(minutes_left))} minutes"
+           rem_card_col, rem_btn_col = st.columns([5, 1.3], vertical_alignment="center")
+           with rem_card_col:
+               st.markdown(
+                   f"""
+                   <div class="reminder-alert-card">
+                       <h4 style="margin:0; color: #92400e;">Reminder: {rem_title}</h4>
+                       <p style="margin:4px 0 0 0; color: #b45309;"><b>{when_text}</b> — {rem_due_display}</p>
+                   </div>
+                   """,
+                   unsafe_allow_html=True,
+               )
+           with rem_btn_col:
+               if st.button("✓ Got it, dismiss", use_container_width=True, key=f"dismiss_rem_{rem_id}"):
+                   dismiss_notification(user_email, "reminder", rem_id)
+                   st.rerun()
+
+
    logs = fetch_logs(user_email)
    quizzes = fetch_quiz_results(user_email)
 
@@ -2940,7 +3022,9 @@ def main():
        st.write("---")
 
 
-       check_and_notify_reminders(user_email)
+       # Superseded by the in-app due-soon banner on the home page — see
+       # get_due_soon_reminders. This OneSignal push call is no longer used.
+       # check_and_notify_reminders(user_email)
 
 
        if st.button("New Chat", use_container_width=True):
@@ -3089,7 +3173,7 @@ def main():
                    with rcol1:
                        st.caption(f"**{rem_title}** — {rem_due_display}")
                    with rcol2:
-                       if st.button("Remove", key=f"del_reminder_{rem_id}"):
+                       if st.button("✕", key=f"del_reminder_{rem_id}", help="Remove reminder"):
                            delete_reminder(rem_id)
                            st.rerun()
            else:
