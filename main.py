@@ -15,8 +15,17 @@ from google import genai
 from google.genai import types
 from streamlit_autorefresh import st_autorefresh
 
+from zoneinfo import ZoneInfo
+
 
 st.set_page_config(page_title="StudySpace", layout="wide")
+
+# Reminders are typed in by students/teachers as their own local wall-clock time
+# (e.g. "1:02 PM"). Streamlit Community Cloud runs its containers in UTC, so
+# comparing against a plain datetime.datetime.now() on the deployed app silently
+# compares against the wrong clock. Pin "now" to the school's real timezone instead,
+# so the due-soon banner fires at the same wall-clock time locally and once deployed.
+APP_TIMEZONE = ZoneInfo("Europe/Tallinn")
 
 
 # Config / Constants
@@ -1143,7 +1152,7 @@ def get_due_soon_reminders(user_email):
    rows = cursor.fetchall()
    conn.close()
 
-   now = datetime.datetime.now()
+   now = datetime.datetime.now(APP_TIMEZONE).replace(tzinfo=None)
    due_soon = []
    for r_id, title, due_at in rows:
        try:
@@ -1174,7 +1183,7 @@ def check_and_notify_reminders(user_email):
    )
    rows = cursor.fetchall()
 
-   now = datetime.datetime.now()
+   now = datetime.datetime.now(APP_TIMEZONE).replace(tzinfo=None)
    for r_id, title, due_at, notified_1h, notified_10m in rows:
        try:
            due_dt = datetime.datetime.fromisoformat(due_at)
