@@ -474,6 +474,15 @@ def delete_login_token(token):
    conn.close()
 
 
+def count_login_tokens():
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute("SELECT COUNT(*) FROM login_tokens")
+   n = cursor.fetchone()[0]
+   conn.close()
+   return n
+
+
 def read_remember_cookie():
    try:
        value = st.context.cookies.get(REMEMBER_COOKIE)
@@ -3315,6 +3324,15 @@ def main():
            st.session_state["active_email"] = remembered_email
 
    emit_cookie_script()
+
+   # Troubleshooting aid: open the site with ?debug=1 while logged out to see why
+   # "stay logged in" did or didn't work. Shows no personal data.
+   if st.query_params.get("debug") == "1" and not st.session_state.get("active_email"):
+       _ck = read_remember_cookie()
+       st.caption(
+           f"debug: cookie received = {bool(_ck)} | cookie matches a saved login = "
+           f"{bool(lookup_login_token(_ck))} | saved logins in database = {count_login_tokens()}"
+       )
 
 
    current_active = st.session_state.get("active_email")
