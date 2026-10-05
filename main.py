@@ -8,6 +8,10 @@ import random
 import time
 import threading
 import smtplib
+import hmac
+import hashlib
+from secrets import randbelow as _secure_randbelow, token_urlsafe as _token_urlsafe
+import streamlit.components.v1 as components
 from email.mime.text import MIMEText
 import requests
 import streamlit as st
@@ -214,6 +218,16 @@ def init_db():
    # home page (e.g. once they've prepared for the test or done the homework)
    # without deleting the underlying test/assignment for anyone else.
    cursor.execute("""
+       CREATE TABLE IF NOT EXISTS login_tokens (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           token_hash TEXT UNIQUE,
+           email TEXT,
+           created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+           expires_at TEXT
+       )
+   """)
+
+   cursor.execute("""
        CREATE TABLE IF NOT EXISTS notification_dismissals (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
            student_email TEXT,
@@ -365,7 +379,132 @@ def check_and_increment_rpd(email, user_tier):
 
 
 def generate_otp():
-   return str(random.randint(100000, 999999))
+   return str(100000 + _secure_randbelow(900000))
+
+
+OTP_MAX_ATTEMPTS = 5
+OTP_TTL_SECONDS = 600
+
+
+def otp_start(prefix):
+   """Call whenever a fresh code is issued: starts the expiry clock and resets attempts."""
+   st.session_state[f"{prefix}_otp_issued_at"] = time.time()
+   st.session_state[f"{prefix}_otp_attempts"] = 0
+
+
+def otp_check(prefix, user_code, expected):
+   """Returns (ok, error_message). Codes expire after 10 minutes and allow 5 wrong tries."""
+   if not expected:
+       return False, "Request a new code first."
+   issued = st.session_state.get(f"{prefix}_otp_issued_at", 0)
+   if time.time() - issued > OTP_TTL_SECONDS:
+       return False, "That code has expired. Please request a new one."
+   attempts = st.session_state.get(f"{prefix}_otp_attempts", 0)
+   if attempts >= OTP_MAX_ATTEMPTS:
+       return False, "Too many wrong attempts. Please request a new code."
+   st.session_state[f"{prefix}_otp_attempts"] = attempts + 1
+   if hmac.compare_digest(user_code.strip(), str(expected)):
+       return True, ""
+   return False, "Invalid code. Please try again."
+
+
+# =========================================================
+# "STAY LOGGED IN" (remember-me cookie)
+# =========================================================
+# After a successful OTP login we give the browser a random token in a cookie and keep
+# only its SHA-256 hash in the database. On the next visit the cookie is read, hashed and
+# looked up; if it matches an unexpired row, the user is logged in without another OTP.
+REMEMBER_COOKIE = "studyspace_token"
+REMEMBER_DAYS = 30
+
+
+def _hash_token(token):
+   return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _utc_now_naive():
+   return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
+def create_login_token(email):
+   token = _token_urlsafe(32)
+   expires = _utc_now_naive() + datetime.timedelta(days=REMEMBER_DAYS)
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       "INSERT INTO login_tokens (token_hash, email, expires_at) VALUES (?, ?, ?)",
+       (_hash_token(token), email.lower().strip(), expires.isoformat()),
+   )
+   conn.commit()
+   conn.close()
+   return token
+
+
+def lookup_login_token(token):
+   """Returns the email this token belongs to, or None if unknown/expired."""
+   if not token:
+       return None
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       "SELECT email, expires_at FROM login_tokens WHERE token_hash = ?",
+       (_hash_token(token),),
+   )
+   row = cursor.fetchone()
+   if row:
+       try:
+           expired = datetime.datetime.fromisoformat(row[1]) < _utc_now_naive()
+       except (TypeError, ValueError):
+           expired = True
+       if expired:
+           cursor.execute("DELETE FROM login_tokens WHERE token_hash = ?", (_hash_token(token),))
+           conn.commit()
+           row = None
+   conn.close()
+   return row[0] if row else None
+
+
+def delete_login_token(token):
+   if not token:
+       return
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute("DELETE FROM login_tokens WHERE token_hash = ?", (_hash_token(token),))
+   conn.commit()
+   conn.close()
+
+
+def read_remember_cookie():
+   try:
+       value = st.context.cookies.get(REMEMBER_COOKIE)
+   except Exception:
+       return None
+   return value if isinstance(value, str) and value else None
+
+
+def start_remembered_session(email):
+   """Call right after a successful login: queues a cookie to be written to the browser."""
+   st.session_state["_set_cookie"] = create_login_token(email)
+
+
+def emit_cookie_script():
+   """Writes or clears the remember-me cookie in the browser (one-shot, invisible)."""
+   token = st.session_state.pop("_set_cookie", None)
+   clear = st.session_state.pop("_clear_cookie", False)
+   if token:
+       max_age = REMEMBER_DAYS * 24 * 3600
+       js = (
+           f"var s = location.protocol === 'https:' ? '; Secure' : '';"
+           f"document.cookie = '{REMEMBER_COOKIE}={token}; path=/; max-age={max_age}; SameSite=Lax' + s;"
+       )
+   elif clear:
+       js = (
+           f"var s = location.protocol === 'https:' ? '; Secure' : '';"
+           f"document.cookie = '{REMEMBER_COOKIE}=; path=/; max-age=0; SameSite=Lax' + s;"
+       )
+   else:
+       return
+   components.html(f"<script>{js}</script>", height=0)
 
 
 
@@ -1558,11 +1697,9 @@ init_db()
 
 
 if "active_email" not in st.session_state:
-   profiles = fetch_all_profiles()
-   if profiles:
-       st.session_state["active_email"] = profiles[0]["email"]
-   else:
-       st.session_state["active_email"] = None
+   # Nobody is logged in until they prove they own an email (OTP). Never default to
+   # an existing profile: that would hand one user's account to every visitor.
+   st.session_state["active_email"] = None
 
 
 if "show_search" not in st.session_state:
@@ -1853,76 +1990,6 @@ st.markdown(
 # =========================================================
 # ACCOUNT SWITCHER DIALOG
 # =========================================================
-@st.dialog("Accounts", width="large")
-def render_account_switcher_dialog():
-   all_profiles = fetch_all_profiles()
-   active_email = st.session_state.get("active_email") or ""
-
-
-   st.markdown("##### Switch Account")
-
-
-   for p in all_profiles:
-       p_email = p["email"]
-       p_name = p["name"]
-       p_role = p["role"].capitalize()
-       is_current = p_email.lower() == active_email.lower()
-       initial = p_name[0].upper() if p_name else "U"
-
-
-       col_left, col_btn = st.columns([5, 1], vertical_alignment="center")
-
-
-       with col_left:
-           st.markdown(
-               f"""
-               <div class="account-row">
-                   <div class="account-avatar">{initial}</div>
-                   <div>
-                       <div style="font-weight: 600; color: #0f172a; font-size: 0.95rem;">
-                           {p_name} {'<span style="color: #2563eb; font-size: 0.8rem;">(Active)</span>' if is_current else ''}
-                       </div>
-                       <div style="font-size: 0.8rem; color: #64748b;">{p_email} • {p_role}</div>
-                   </div>
-               </div>
-               """,
-               unsafe_allow_html=True,
-           )
-
-
-       with col_btn:
-           if not is_current:
-               if st.button("Switch", key=f"sw_{p_email}"):
-                   st.session_state["account_action"] = ("switch", p_email)
-                   st.rerun()
-
-
-       st.write("")
-
-
-   st.markdown("---")
-
-
-   if st.button(
-           "Add another account",
-           use_container_width=True,
-           key="dlg_add_account_btn",
-   ):
-       st.session_state["account_action"] = ("add", None)
-       st.rerun()
-
-
-   if st.button(
-           "Sign out of all accounts",
-           use_container_width=True,
-           key="dlg_signout_btn",
-   ):
-       st.session_state["account_action"] = ("signout", None)
-       st.rerun()
-
-
-
-
 # =========================================================
 # UPGRADE PLAN DIALOG WITH STRIPE LINKS
 # =========================================================
@@ -2008,6 +2075,190 @@ def render_upgrade_dialog(profile):
 
 
 # =========================================================
+# EDIT PROFILE (study times, topic focus, goal, grade)
+# =========================================================
+EDIT_SUBJECT_OPTIONS = [
+   "Mathematics", "Physics", "Chemistry", "Biology", "Computer Science",
+   "English", "History", "Geography", "Civics", "Economics",
+   "Environmental Science", "Foreign Language",
+]
+EDIT_GRADE_OPTIONS = [
+   "6th Grade", "7th Grade", "8th Grade", "9th Grade", "10th Grade",
+   "11th Grade", "12th Grade", "College / University", "Other",
+]
+EDIT_DAY_OPTIONS = [
+   "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+]
+
+
+def update_user_profile_details(email, name, purpose, interests, schedule, grade):
+   conn = sqlite3.connect(DB_NAME)
+   cursor = conn.cursor()
+   cursor.execute(
+       """
+       UPDATE user_profile
+       SET name = ?, purpose = ?, interests = ?, schedule = ?, grade = ?
+       WHERE LOWER(email) = ?
+   """,
+       (name, purpose, interests, schedule, grade, email.lower().strip()),
+   )
+   conn.commit()
+   conn.close()
+
+
+def parse_schedule_string(schedule):
+   """Turns 'Monday: 04:00 PM - 06:00 PM | Friday: ...' back into
+   {day: (start_time, end_time)} so the edit form can pre-fill it."""
+   parsed = {}
+   if not schedule:
+       return parsed
+   for part in schedule.split(" | "):
+       try:
+           day, times = part.split(": ", 1)
+           start_s, end_s = times.split(" - ")
+           parsed[day.strip()] = (
+               datetime.datetime.strptime(start_s.strip(), "%I:%M %p").time(),
+               datetime.datetime.strptime(end_s.strip(), "%I:%M %p").time(),
+           )
+       except ValueError:
+           continue
+   return parsed
+
+
+@st.dialog("Edit Your Profile", width="large")
+def render_edit_profile_dialog(profile):
+   user_email = profile["email"]
+   is_teacher = profile.get("role", "student") == "teacher"
+   st.caption(f"{user_email} · {profile.get('role', 'student').capitalize()} (email and role can't be changed)")
+
+   new_name = st.text_input("Name", value=profile.get("name", ""), key="edit_name")
+
+   if is_teacher:
+       new_grade = "Teacher"
+       goals = [
+           "Managing my classes & sending assignments",
+           "Generating AI mock tests",
+           "Tracking progress",
+       ]
+   else:
+       current_grade = profile.get("grade", "")
+       new_grade = st.selectbox(
+           "Grade",
+           EDIT_GRADE_OPTIONS,
+           index=EDIT_GRADE_OPTIONS.index(current_grade) if current_grade in EDIT_GRADE_OPTIONS else 3,
+           key="edit_grade",
+       )
+       goals = ["Preparing for exams", "Building study habits", "General tutoring"]
+
+   current_purpose = profile.get("purpose", "")
+   new_purpose = st.radio(
+       "Main goal",
+       goals,
+       index=goals.index(current_purpose) if current_purpose in goals else 0,
+       key="edit_purpose",
+   )
+
+   current_subjects = [
+       s.strip() for s in (profile.get("interests") or "").split(",")
+       if s.strip() in EDIT_SUBJECT_OPTIONS
+   ]
+   selected_subjects = st.multiselect(
+       "Topic focus (subjects)",
+       EDIT_SUBJECT_OPTIONS,
+       default=current_subjects,
+       key="edit_subjects",
+   )
+
+   new_schedule = profile.get("schedule", "") or ""
+   if not is_teacher:
+       st.markdown("##### Study times")
+       existing = parse_schedule_string(profile.get("schedule", ""))
+       selected_days = st.multiselect(
+           "Study days",
+           EDIT_DAY_OPTIONS,
+           default=[d for d in EDIT_DAY_OPTIONS if d in existing] or ["Monday", "Wednesday", "Friday"],
+           key="edit_days",
+       )
+       schedule_details = []
+       for day in selected_days:
+           default_start, default_end = existing.get(day, (datetime.time(16, 0), datetime.time(18, 0)))
+           c1, c2 = st.columns(2)
+           with c1:
+               s_time = st.time_input(f"{day} start", default_start, key=f"edit_start_{day}")
+           with c2:
+               e_time = st.time_input(f"{day} end", default_end, key=f"edit_end_{day}")
+           schedule_details.append(
+               f"{day}: {s_time.strftime('%I:%M %p')} - {e_time.strftime('%I:%M %p')}"
+           )
+       new_schedule = " | ".join(schedule_details) if schedule_details else "No schedule set"
+
+   if st.button("Save changes", use_container_width=True, key="btn_save_profile"):
+       if not new_name.strip():
+           st.warning("Name can't be empty.")
+       else:
+           update_user_profile_details(
+               user_email,
+               new_name.strip(),
+               new_purpose,
+               ", ".join(selected_subjects) if selected_subjects else "General",
+               new_schedule,
+               new_grade,
+           )
+           st.rerun()
+
+
+def render_login_form():
+   st.subheader("Log in to your account")
+   login_email = st.text_input("Email", key="login_email_input")
+   email_norm = login_email.strip().lower()
+
+   def send_login_code():
+       if not email_norm:
+           st.warning("Enter your email first.")
+           return
+       if not fetch_user_profile(email_norm):
+           st.error("No account found with that email. Choose 'Create account' above to sign up.")
+           return
+       otp = generate_otp()
+       if send_otp_email(email_norm, otp):
+           st.session_state["login_generated_otp"] = otp
+           st.session_state["login_otp_email"] = email_norm
+           st.session_state["login_otp_sent"] = True
+           otp_start("login")
+           st.rerun()
+       else:
+           st.error(st.session_state.get("last_otp_error", "Couldn't send the code."))
+
+   code_sent_for_this_email = (
+       st.session_state.get("login_otp_sent")
+       and st.session_state.get("login_otp_email") == email_norm
+   )
+   if not code_sent_for_this_email:
+       if st.button("Send login code", use_container_width=True, key="btn_login_send"):
+           send_login_code()
+   else:
+       st.success(f"Code sent to {email_norm}.")
+       code = st.text_input("Enter 6-digit login code:", key="login_code_input")
+       st.caption("Didn't get an email? Check your spam/junk folder — it can take a minute to arrive.")
+       col_in, col_re = st.columns(2)
+       with col_in:
+           if st.button("Log in", use_container_width=True, key="btn_login_verify"):
+               ok, msg = otp_check("login", code, st.session_state.get("login_generated_otp"))
+               if ok:
+                   st.session_state["active_email"] = email_norm
+                   st.session_state["is_logged_in"] = True
+                   start_remembered_session(email_norm)
+                   for k in ("login_generated_otp", "login_otp_email", "login_otp_sent"):
+                       st.session_state.pop(k, None)
+                   st.rerun()
+               else:
+                   st.error(msg)
+       with col_re:
+           if st.button("Resend code", use_container_width=True, key="btn_login_resend"):
+               send_login_code()
+
+
+# =========================================================
 # ONBOARDING WIZARD
 # =========================================================
 def render_onboarding_wizard():
@@ -2052,12 +2303,23 @@ def render_onboarding_wizard():
 
 
    with card_col:
+       auth_mode = st.radio(
+           "Account",
+           ["Create account", "Log in"],
+           horizontal=True,
+           key="auth_mode_radio",
+           label_visibility="collapsed",
+       )
+       if auth_mode == "Log in":
+           render_login_form()
+           return
+
        st.progress(min(step / total_steps, 1.0))
        st.caption(f"Step {step} of {total_steps}")
 
 
        if step == 1:
-           st.subheader("What's your name, email & role?")
+           st.subheader("Please fill in your details to create an account")
            st.session_state["form_data"]["name"] = st.text_input(
                "Name", value=st.session_state["form_data"]["name"]
            )
@@ -2065,6 +2327,12 @@ def render_onboarding_wizard():
                "Email", value=st.session_state["form_data"]["email"]
            )
            st.session_state["form_data"]["email"] = email_val
+           if st.session_state.get("email_verified") and st.session_state.get("verified_email") != email_val.strip().lower():
+               # Email was changed after verifying: the old verification no longer applies.
+               st.session_state["email_verified"] = False
+               st.session_state["otp_sent"] = False
+               st.session_state["generated_otp"] = None
+               st.session_state["otp_email_confirmed"] = False
 
 
            role_choice = st.radio(
@@ -2097,9 +2365,12 @@ def render_onboarding_wizard():
                    if st.button(
                            "Send Verification OTP", use_container_width=True, key="btn_send_otp"
                    ):
-                       if email_val.strip():
+                       if email_val.strip() and fetch_user_profile(email_val.strip().lower()):
+                           st.error("This email is already in use. Choose 'Log in' above to access your account.")
+                       elif email_val.strip():
                            otp = generate_otp()
                            st.session_state["generated_otp"] = otp
+                           otp_start("signup")
                            if send_otp_email(email_val.strip(), otp):
                                st.session_state["otp_sent"] = True
                                st.session_state["otp_email_confirmed"] = True
@@ -2122,15 +2393,19 @@ def render_onboarding_wizard():
                    col_v, col_r = st.columns([1, 1])
                    with col_v:
                        if st.button("Verify OTP", use_container_width=True, key="btn_verify_otp"):
-                           if (
-                                   user_code.strip()
-                                   == st.session_state["generated_otp"]
-                           ):
-                               st.session_state["email_verified"] = True
-                               st.success("Email Verified successfully!")
-                               st.rerun()
+                           otp_ok, otp_msg = otp_check("signup", user_code, st.session_state["generated_otp"])
+                           if otp_ok:
+                               if fetch_user_profile(email_val.strip().lower()):
+                                   st.session_state["otp_sent"] = False
+                                   st.session_state["generated_otp"] = None
+                                   st.error("This email is already in use. Choose 'Log in' above to access your account.")
+                               else:
+                                   st.session_state["email_verified"] = True
+                                   st.session_state["verified_email"] = email_val.strip().lower()
+                                   st.success("Email Verified successfully!")
+                                   st.rerun()
                            else:
-                               st.error("Invalid OTP code. Please try again.")
+                               st.error(otp_msg)
                    with col_r:
                        resend_clicked = st.button(
                            "Resend OTP", use_container_width=True, key="btn_resend_otp"
@@ -2141,6 +2416,7 @@ def render_onboarding_wizard():
                            if email_val.strip():
                                new_otp = generate_otp()
                                st.session_state["generated_otp"] = new_otp
+                               otp_start("signup")
                                if send_otp_email(email_val.strip(), new_otp):
                                    st.session_state["otp_email_confirmed"] = True
                                    st.success(
@@ -2250,16 +2526,20 @@ def render_onboarding_wizard():
                st.rerun()
        with btn_col2:
            if step < total_steps:
-               if st.button("Next", use_container_width=True, key="btn_wizard_next"):
-                   if step == 1 and not st.session_state["email_verified"]:
-                       st.error("Please verify your email address first!")
-                   else:
-                       st.session_state["wizard_step"] += 1
-                       st.rerun()
+               if step == 1 and not st.session_state["email_verified"]:
+                   # No Next button until the OTP has been verified.
+                   st.caption("Verify your email with the code to continue.")
+               elif st.button("Next", use_container_width=True, key="btn_wizard_next"):
+                   st.session_state["wizard_step"] += 1
+                   st.rerun()
            else:
                if st.button("Complete Setup", use_container_width=True, key="btn_wizard_complete"):
                    fd = st.session_state["form_data"]
                    user_e = fd["email"].strip().lower()
+                   if fetch_user_profile(user_e):
+                       # Never overwrite an existing account (any role) via the signup form.
+                       st.error("This email is already in use. Choose 'Log in' above to access your account.")
+                       st.stop()
                    save_user_profile(
                        fd["name"],
                        user_e,
@@ -2272,6 +2552,7 @@ def render_onboarding_wizard():
                    )
                    st.session_state["active_email"] = user_e
                    st.session_state["is_logged_in"] = True
+                   start_remembered_session(user_e)
                    st.rerun()
 
 
@@ -2993,10 +3274,7 @@ def render_onesignal_web_push_snippet(user_email):
 def main():
    if "account_action" in st.session_state:
        action, target_email = st.session_state.pop("account_action")
-       if action == "switch":
-           st.session_state["active_email"] = target_email
-           st.rerun()
-       elif action == "add":
+       if action == "add":
            st.session_state["active_email"] = None
            st.session_state["is_logged_in"] = False
            st.session_state["wizard_step"] = 1
@@ -3014,8 +3292,18 @@ def main():
            }
            st.rerun()
        elif action == "signout":
+           delete_login_token(read_remember_cookie())
            st.session_state.clear()
+           st.session_state["_clear_cookie"] = True
            st.rerun()
+
+   # Returning visitor with a valid "stay logged in" cookie: log them in without an OTP.
+   if not st.session_state.get("active_email"):
+       remembered_email = lookup_login_token(read_remember_cookie())
+       if remembered_email and fetch_user_profile(remembered_email):
+           st.session_state["active_email"] = remembered_email
+
+   emit_cookie_script()
 
 
    current_active = st.session_state.get("active_email")
@@ -3028,9 +3316,7 @@ def main():
 
 
    if "page" not in st.session_state:
-       st.session_state["page"] = (
-           "AI Tutor" if active_profile.get("default_to_ai") else "Home"
-       )
+       st.session_state["page"] = "Home"
 
 
    user_name = active_profile["name"]
@@ -3293,19 +3579,12 @@ def main():
        )
 
 
-       current_default_ai = active_profile.get("default_to_ai", False)
-       default_ai_toggle = st.toggle(
-           "Open AI Chat on Startup",
-           value=current_default_ai,
-           key="startup_ai_toggle",
-       )
-       if default_ai_toggle != current_default_ai:
-           update_default_to_ai(user_email, default_ai_toggle)
+       if st.button("Edit My Profile", use_container_width=True, key="btn_edit_profile"):
+           render_edit_profile_dialog(active_profile)
+
+       if st.button("Log Out", use_container_width=True, key="btn_logout"):
+           st.session_state["account_action"] = ("signout", None)
            st.rerun()
-
-
-       if st.button("Switch Account / Log Out", use_container_width=True):
-           render_account_switcher_dialog()
 
 
    if st.session_state["page"] == "Home":
