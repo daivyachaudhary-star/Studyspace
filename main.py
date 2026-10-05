@@ -2539,8 +2539,7 @@ def render_onboarding_wizard():
        with btn_col2:
            if step < total_steps:
                if step == 1 and not st.session_state["email_verified"]:
-                   # No Next button until the OTP has been verified.
-                   st.caption("Verify your email with the code to continue.")
+                   pass  # No Next button until the OTP has been verified.
                elif st.button("Next", use_container_width=True, key="btn_wizard_next"):
                    st.session_state["wizard_step"] += 1
                    st.rerun()
