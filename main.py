@@ -2217,7 +2217,7 @@ def render_login_form():
            st.warning("Enter your email first.")
            return
        if not fetch_user_profile(email_norm):
-           st.error("No account found with that email. Choose 'Create account' above to sign up.")
+           st.error("No account found with that email. Use 'New here? Create an account' below to sign up.")
            return
        otp = generate_otp()
        if send_otp_email(email_norm, otp):
@@ -2256,6 +2256,15 @@ def render_login_form():
        with col_re:
            if st.button("Resend code", use_container_width=True, key="btn_login_resend"):
                send_login_code()
+
+   if st.button(
+           "New here? Create an account",
+           use_container_width=True,
+           type="tertiary",
+           key="btn_goto_signup",
+   ):
+       st.session_state["auth_mode"] = "signup"
+       st.rerun()
 
 
 # =========================================================
@@ -2303,14 +2312,7 @@ def render_onboarding_wizard():
 
 
    with card_col:
-       auth_mode = st.radio(
-           "Account",
-           ["Create account", "Log in"],
-           horizontal=True,
-           key="auth_mode_radio",
-           label_visibility="collapsed",
-       )
-       if auth_mode == "Log in":
+       if st.session_state.get("auth_mode") == "login":
            render_login_form()
            return
 
@@ -2366,7 +2368,7 @@ def render_onboarding_wizard():
                            "Send Verification OTP", use_container_width=True, key="btn_send_otp"
                    ):
                        if email_val.strip() and fetch_user_profile(email_val.strip().lower()):
-                           st.error("This email is already in use. Choose 'Log in' above to access your account.")
+                           st.error("This email is already in use. Use 'Already have an account? Log in' below to access your account.")
                        elif email_val.strip():
                            otp = generate_otp()
                            st.session_state["generated_otp"] = otp
@@ -2398,7 +2400,7 @@ def render_onboarding_wizard():
                                if fetch_user_profile(email_val.strip().lower()):
                                    st.session_state["otp_sent"] = False
                                    st.session_state["generated_otp"] = None
-                                   st.error("This email is already in use. Choose 'Log in' above to access your account.")
+                                   st.error("This email is already in use. Use 'Already have an account? Log in' below to access your account.")
                                else:
                                    st.session_state["email_verified"] = True
                                    st.session_state["verified_email"] = email_val.strip().lower()
@@ -2519,6 +2521,16 @@ def render_onboarding_wizard():
            )
 
 
+       if step == 1 and not st.session_state["email_verified"]:
+           if st.button(
+                   "Already have an account? Log in",
+                   use_container_width=True,
+                   type="tertiary",
+                   key="btn_goto_login",
+           ):
+               st.session_state["auth_mode"] = "login"
+               st.rerun()
+
        btn_col1, btn_col2 = st.columns([1, 1])
        with btn_col1:
            if step > 1 and st.button("Back", use_container_width=True, key="btn_wizard_back"):
@@ -2538,7 +2550,7 @@ def render_onboarding_wizard():
                    user_e = fd["email"].strip().lower()
                    if fetch_user_profile(user_e):
                        # Never overwrite an existing account (any role) via the signup form.
-                       st.error("This email is already in use. Choose 'Log in' above to access your account.")
+                       st.error("This email is already in use. Use 'Already have an account? Log in' below to access your account.")
                        st.stop()
                    save_user_profile(
                        fd["name"],
