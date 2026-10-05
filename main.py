@@ -491,6 +491,28 @@ def read_remember_cookie():
    return value if isinstance(value, str) and value else None
 
 
+# Streamlit Community Cloud does not forward our cookie to st.context.cookies, so we also
+# read it in the browser through a tiny component (cookie_bridge/index.html).
+try:
+   _cookie_bridge = components.declare_component(
+       "studyspace_cookie_bridge",
+       path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie_bridge"),
+   )
+except Exception:
+   _cookie_bridge = None
+
+
+def read_bridge_token():
+   if _cookie_bridge is None:
+       return None
+   try:
+       value = _cookie_bridge(key="cookie_bridge", default=None)
+   except Exception:
+       return None
+   token = value.get("token") if isinstance(value, dict) else None
+   return token if isinstance(token, str) and token else None
+
+
 def start_remembered_session(email):
    """Call right after a successful login: queues a cookie to be written to the browser."""
    st.session_state["_remember_token"] = create_login_token(email)
@@ -3315,14 +3337,15 @@ def main():
            }
            st.rerun()
        elif action == "signout":
-           delete_login_token(read_remember_cookie())
+           delete_login_token(st.session_state.get("_remember_token") or read_remember_cookie())
            st.session_state.clear()
            st.session_state["_clear_cookie"] = True
            st.rerun()
 
    # Returning visitor with a valid "stay logged in" cookie: log them in without an OTP.
+   bridge_token = read_bridge_token()
    if not st.session_state.get("active_email"):
-       _cookie_token = read_remember_cookie()
+       _cookie_token = read_remember_cookie() or bridge_token
        remembered_email = lookup_login_token(_cookie_token)
        if remembered_email and fetch_user_profile(remembered_email):
            st.session_state["active_email"] = remembered_email
@@ -3334,9 +3357,14 @@ def main():
    # "stay logged in" did or didn't work. Shows no personal data.
    if st.query_params.get("debug") == "1" and not st.session_state.get("active_email"):
        _ck = read_remember_cookie()
+       try:
+           _server_names = sorted(st.context.cookies.keys())
+       except Exception:
+           _server_names = []
        st.caption(
-           f"debug: cookie received = {bool(_ck)} | cookie matches a saved login = "
-           f"{bool(lookup_login_token(_ck))} | saved logins in database = {count_login_tokens()}"
+           f"debug: cookie received by server = {bool(_ck)} | received via browser bridge = {bool(bridge_token)} | "
+           f"matches a saved login = {bool(lookup_login_token(_ck or bridge_token))} | "
+           f"saved logins in database = {count_login_tokens()} | cookies the server can see = {_server_names}"
        )
        components.html(
            "<div id='o' style='font:12px sans-serif;color:#555'></div><script>"
