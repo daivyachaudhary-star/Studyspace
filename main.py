@@ -493,12 +493,15 @@ def read_remember_cookie():
 
 def start_remembered_session(email):
    """Call right after a successful login: queues a cookie to be written to the browser."""
-   st.session_state["_set_cookie"] = create_login_token(email)
+   st.session_state["_remember_token"] = create_login_token(email)
 
 
 def emit_cookie_script():
    """Writes or clears the remember-me cookie in the browser (one-shot, invisible)."""
-   token = st.session_state.pop("_set_cookie", None)
+   # The cookie is re-written on every run while logged in (idempotent). Writing it only
+   # once was fragile: if another rerun fired before the invisible iframe loaded, the
+   # cookie was never set.
+   token = st.session_state.get("_remember_token") if st.session_state.get("active_email") else None
    clear = st.session_state.pop("_clear_cookie", False)
    if token:
        max_age = REMEMBER_DAYS * 24 * 3600
@@ -3319,9 +3322,11 @@ def main():
 
    # Returning visitor with a valid "stay logged in" cookie: log them in without an OTP.
    if not st.session_state.get("active_email"):
-       remembered_email = lookup_login_token(read_remember_cookie())
+       _cookie_token = read_remember_cookie()
+       remembered_email = lookup_login_token(_cookie_token)
        if remembered_email and fetch_user_profile(remembered_email):
            st.session_state["active_email"] = remembered_email
+           st.session_state["_remember_token"] = _cookie_token
 
    emit_cookie_script()
 
@@ -3332,6 +3337,14 @@ def main():
        st.caption(
            f"debug: cookie received = {bool(_ck)} | cookie matches a saved login = "
            f"{bool(lookup_login_token(_ck))} | saved logins in database = {count_login_tokens()}"
+       )
+       components.html(
+           "<div id='o' style='font:12px sans-serif;color:#555'></div><script>"
+           "var n=document.cookie.split(';').map(function(c){return c.trim().split('=')[0]}).filter(Boolean);"
+           "document.getElementById('o').textContent='debug (browser side): cookie names the page can see = ['"
+           "+n.join(', ')+']  |  has studyspace_token = '+(n.indexOf('studyspace_token')>=0);"
+           "</script>",
+           height=24,
        )
 
 
