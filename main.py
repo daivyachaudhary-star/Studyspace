@@ -1,6 +1,6 @@
 import os
 import re
-import sqlite3
+import db  # database layer: hosted Postgres (Supabase) or local SQLite file
 import datetime
 import json
 import base64
@@ -33,7 +33,6 @@ APP_TIMEZONE = ZoneInfo("Europe/Tallinn")
 
 
 # Config / Constants
-DB_NAME = "studyspace.db"
 ONESIGNAL_APP_ID = st.secrets.get("ONESIGNAL_APP_ID", "")
 ONESIGNAL_REST_KEY = st.secrets.get("ONESIGNAL_REST_KEY", "")
 EMAIL_ADDRESS = st.secrets.get("EMAIL_ADDRESS", "")
@@ -60,7 +59,7 @@ TIER_CONFIG = {
 # DATABASE SETUP & USER PROFILES
 # =========================================================
 def init_db():
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
 
 
@@ -261,7 +260,7 @@ def init_db():
 
 
 def store_knowledge_item(email, subject, topic, specific_area, raw_text):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -277,7 +276,7 @@ def store_knowledge_item(email, subject, topic, specific_area, raw_text):
 
 
 def fetch_stored_topics(email, subject=None):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    if subject:
        cursor.execute(
@@ -307,7 +306,7 @@ def fetch_stored_topics(email, subject=None):
 
 
 def add_class_test(class_id, test_title, subject, topic, test_date):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -323,7 +322,7 @@ def add_class_test(class_id, test_title, subject, topic, test_date):
 
 
 def get_current_rpd_count(email):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    today_str = datetime.date.today().isoformat()
    cursor.execute(
@@ -338,7 +337,7 @@ def get_current_rpd_count(email):
 
 
 def check_and_increment_rpd(email, user_tier):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    today_str = datetime.date.today().isoformat()
 
@@ -429,7 +428,7 @@ def _utc_now_naive():
 def create_login_token(email):
    token = _token_urlsafe(32)
    expires = _utc_now_naive() + datetime.timedelta(days=REMEMBER_DAYS)
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "INSERT INTO login_tokens (token_hash, email, expires_at) VALUES (?, ?, ?)",
@@ -444,7 +443,7 @@ def lookup_login_token(token):
    """Returns the email this token belongs to, or None if unknown/expired."""
    if not token:
        return None
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT email, expires_at FROM login_tokens WHERE token_hash = ?",
@@ -467,7 +466,7 @@ def lookup_login_token(token):
 def delete_login_token(token):
    if not token:
        return
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute("DELETE FROM login_tokens WHERE token_hash = ?", (_hash_token(token),))
    conn.commit()
@@ -475,7 +474,7 @@ def delete_login_token(token):
 
 
 def count_login_tokens():
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute("SELECT COUNT(*) FROM login_tokens")
    n = cursor.fetchone()[0]
@@ -582,7 +581,7 @@ def save_user_profile(
    grade="",
    tier="freemium",
 ):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -616,7 +615,7 @@ def save_user_profile(
 
 
 def update_default_to_ai(email, val):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "UPDATE user_profile SET default_to_ai = ? WHERE LOWER(email) = ?",
@@ -629,7 +628,7 @@ def update_default_to_ai(email, val):
 
 
 def update_save_topic_memory(email, val):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "UPDATE user_profile SET save_topic_memory = ? WHERE LOWER(email) = ?",
@@ -642,7 +641,7 @@ def update_save_topic_memory(email, val):
 
 
 def fetch_all_profiles():
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT name, email, purpose, interests, schedule, tier, is_onboarded, default_to_ai, save_topic_memory, role, grade FROM user_profile"
@@ -676,7 +675,7 @@ def fetch_all_profiles():
 def fetch_user_profile(email=None):
    if not email:
        return None
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT name, email, purpose, interests, schedule, tier, is_onboarded, default_to_ai, save_topic_memory, role, grade FROM user_profile WHERE LOWER(email) = ? LIMIT 1",
@@ -706,7 +705,7 @@ def fetch_user_profile(email=None):
 
 
 def log_session(topic, email):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "INSERT INTO study_logs (email, topic) VALUES (?, ?)", (email, topic)
@@ -718,7 +717,7 @@ def log_session(topic, email):
 
 
 def fetch_logs(email=None):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    if email:
        cursor.execute(
@@ -740,7 +739,7 @@ def fetch_logs(email=None):
 # PERSISTED CHAT HISTORY ("RECENT CHATS")
 # =========================================================
 def create_chat_session(email, title):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    clean_title = (title or "New chat").strip()[:80] or "New chat"
    cursor.execute(
@@ -754,7 +753,7 @@ def create_chat_session(email, title):
 
 
 def touch_chat_session(session_id):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -768,7 +767,7 @@ def save_chat_message(session_id, role, content, image_bytes=None, mime_type=Non
                        help_stage=None, original_prompt=None):
    if not session_id:
        return
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -783,7 +782,7 @@ def save_chat_message(session_id, role, content, image_bytes=None, mime_type=Non
 
 
 def get_recent_chat_sessions(email, limit=10):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT id, title, updated_at FROM chat_sessions WHERE LOWER(email) = ? ORDER BY updated_at DESC LIMIT ?",
@@ -795,7 +794,7 @@ def get_recent_chat_sessions(email, limit=10):
 
 
 def get_chat_session_messages(session_id):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -823,7 +822,7 @@ def get_chat_session_messages(session_id):
 
 
 def delete_chat_session(session_id):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
    cursor.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
@@ -866,7 +865,7 @@ def resume_chat_session(session_id):
 
 
 def fetch_quiz_results(email=None):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    if email:
        cursor.execute(
@@ -939,7 +938,7 @@ def send_onesignal_notification(email, title, message):
 
 def check_and_notify_upcoming_tests(student_email):
    """Checks database for upcoming tests within 3 days and prompts notification."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    today_str = datetime.date.today().isoformat()
    three_days_later = (datetime.date.today() + datetime.timedelta(days=3)).isoformat()
@@ -974,7 +973,7 @@ def get_upcoming_tests_for_display(student_email):
    student has dismissed from their home page. Unlike check_and_notify_upcoming_tests
    (which is one-shot, for firing the push notification), this is what actually
    drives the home page banner, so it stays visible until dismissed."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    today_str = datetime.date.today().isoformat()
    cursor.execute(
@@ -999,7 +998,7 @@ def get_upcoming_tests_for_display(student_email):
 
 def dismiss_notification(student_email, notif_type, ref_id):
    """Marks a single test/homework banner as dismissed for this student only."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "INSERT OR IGNORE INTO notification_dismissals (student_email, notif_type, ref_id) VALUES (?, ?, ?)",
@@ -1021,7 +1020,7 @@ def generate_join_code():
 def create_class(teacher_email, class_name):
    """Creates a class for this teacher and returns a fresh unique 6-digit join code.
    Returns (ok, result) — result is the join code on success, or an error message on failure."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
 
    cursor.execute(
@@ -1042,14 +1041,14 @@ def create_class(teacher_email, class_name):
            conn.commit()
            conn.close()
            return True, code
-       except sqlite3.IntegrityError:
+       except db.IntegrityError:
            continue
    conn.close()
    return False, "Couldn't generate a join code, try again."
 
 
 def get_teacher_classes(teacher_email):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT id, class_name, join_code FROM classes WHERE LOWER(teacher_email) = ? ORDER BY created_at DESC",
@@ -1061,7 +1060,7 @@ def get_teacher_classes(teacher_email):
 
 
 def get_class_by_code(join_code):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT id, teacher_email, class_name FROM classes WHERE join_code = ?",
@@ -1080,7 +1079,7 @@ def request_join_class(student_email, student_name, join_code):
 
    class_id, teacher_email, class_name = class_row
 
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT status FROM class_enrollment WHERE class_id = ? AND LOWER(student_email) = ?",
@@ -1111,7 +1110,7 @@ def request_join_class(student_email, student_name, join_code):
 
 
 def get_pending_join_requests(teacher_email):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -1128,7 +1127,7 @@ def get_pending_join_requests(teacher_email):
 
 
 def update_join_request_status(enrollment_id, status):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute("UPDATE class_enrollment SET status = ? WHERE id = ?", (status, enrollment_id))
    conn.commit()
@@ -1136,7 +1135,7 @@ def update_join_request_status(enrollment_id, status):
 
 
 def get_approved_students_for_class(class_id):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT student_email FROM class_enrollment WHERE class_id = ? AND status = 'approved'",
@@ -1149,7 +1148,7 @@ def get_approved_students_for_class(class_id):
 
 def get_students_for_class(class_id):
    """Returns (student_name, student_email) for every approved student in a class."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT student_name, student_email FROM class_enrollment WHERE class_id = ? AND status = 'approved' ORDER BY student_name",
@@ -1162,7 +1161,7 @@ def get_students_for_class(class_id):
 
 def get_student_classes(student_email):
    """Returns (class_id, class_name, teacher_email, join_code) for every class this student is approved into."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -1180,7 +1179,7 @@ def get_student_classes(student_email):
 
 
 def get_class_homework(class_id):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT title, topic, due_date FROM assignments WHERE class_id = ? ORDER BY due_date DESC",
@@ -1192,7 +1191,7 @@ def get_class_homework(class_id):
 
 
 def get_class_tests_for_class(class_id):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT test_title, subject, topic, test_date FROM class_tests WHERE class_id = ? ORDER BY test_date",
@@ -1207,7 +1206,7 @@ def get_student_upcoming_homework(student_email):
    """Returns (id, title, topic, due_date, class_name) for homework due today or later,
    across every class this student is approved into, minus any the student has
    dismissed (e.g. because they already did it) from their home page."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    today_str = datetime.date.today().isoformat()
    cursor.execute(
@@ -1237,7 +1236,7 @@ def notify_class_students(class_id, title, message):
 
 def create_assignment(class_id, class_name, title, topic, due_date):
    """Posts a homework item for a class and immediately pings enrolled students."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "INSERT INTO assignments (class_id, title, topic, due_date) VALUES (?, ?, ?, ?)",
@@ -1254,7 +1253,7 @@ def create_assignment(class_id, class_name, title, topic, due_date):
 
 
 def get_class_assignment_count(teacher_email):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -1275,7 +1274,7 @@ def get_class_assignment_count(teacher_email):
 # PERSONAL SCHEDULED REMINDERS
 # =========================================================
 def create_reminder(user_email, title, due_at_iso):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "INSERT INTO reminders (user_email, title, due_at) VALUES (?, ?, ?)",
@@ -1287,7 +1286,7 @@ def create_reminder(user_email, title, due_at_iso):
 
 def get_upcoming_reminders(user_email):
    """Returns this user's reminders that haven't fully fired yet, soonest first."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -1309,7 +1308,7 @@ def get_due_soon_reminders(user_email):
    dismiss-table pattern get_upcoming_tests_for_display already uses for test
    and homework alerts. Replaces the old OneSignal-push reminder path, which
    depended on a browser permission prompt that was never confirmed to work."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """
@@ -1339,7 +1338,7 @@ def get_due_soon_reminders(user_email):
 
 
 def delete_reminder(reminder_id):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
    conn.commit()
@@ -1348,7 +1347,7 @@ def delete_reminder(reminder_id):
 
 def check_and_notify_reminders(user_email):
    """Pull-based check, run on page load: pings 1h and 10m before a reminder is due."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT id, title, due_at, notified_1h, notified_10m FROM reminders WHERE LOWER(user_email) = ?",
@@ -1392,7 +1391,7 @@ def check_and_notify_all_reminders():
    """Same as check_and_notify_reminders, but for every user with a pending reminder.
    Meant to be run on a timer (see start_reminder_scheduler), not tied to any one
    browser session, so reminders still fire even if nobody has the app open."""
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        "SELECT DISTINCT user_email FROM reminders WHERE notified_10m = 0"
@@ -1722,7 +1721,15 @@ def generate_mock_test_from_memory(user_email, target_subject=None):
 
 
 # INITIALIZE APPLICATION COMPONENTS
-init_db()
+@st.cache_resource
+def _init_db_once():
+   # Creating the tables on every rerun is slow on a hosted database, so do it
+   # once per app start.
+   init_db()
+   return True
+
+
+_init_db_once()
 # Superseded by the in-app due-soon banner (get_due_soon_reminders, used in
 # render_home_page): that's a live query on page load, so this background
 # push-based thread no longer needs to run. Left defined, not deleted, in
@@ -2126,7 +2133,7 @@ EDIT_DAY_OPTIONS = [
 
 
 def update_user_profile_details(email, name, purpose, interests, schedule, grade):
-   conn = sqlite3.connect(DB_NAME)
+   conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
        """

@@ -1,0 +1,174 @@
+"""Database layer for StudySpace.
+
+The app was written for SQLite (a single file, studyspace.db). Streamlit Community
+Cloud wipes files that are not in the GitHub repo every time the app restarts, so
+accounts and chats were lost. This module keeps the same code working but stores
+the data in a hosted PostgreSQL database (Supabase) when a DATABASE_URL secret is
+set. Without DATABASE_URL it falls back to the local SQLite file, so the app still
+runs on your own computer exactly as before.
+
+main.py only needs two things from here:
+    db.connect()         -> a connection with .cursor(), .commit(), .close()
+    db.IntegrityError    -> the error raised when a UNIQUE value already exists
+"""
+import os
+import re
+import sqlite3
+import threading
+
+SQLITE_FILE = "studyspace.db"
+
+
+def _database_url():
+    url = os.environ.get("DATABASE_URL", "")
+    if url:
+        return url
+    try:
+        import streamlit as st
+        return st.secrets.get("DATABASE_URL", "") or ""
+    except Exception:
+        return ""
+
+
+DATABASE_URL = _database_url()
+USING_POSTGRES = bool(DATABASE_URL)
+
+if USING_POSTGRES:
+    import psycopg
+    from psycopg_pool import ConnectionPool
+
+    IntegrityError = (sqlite3.IntegrityError, psycopg.errors.IntegrityError)
+else:
+    IntegrityError = sqlite3.IntegrityError
+
+
+# ---------------------------------------------------------------------------
+# SQLite -> PostgreSQL translation (only used when DATABASE_URL is set)
+# ---------------------------------------------------------------------------
+# SQLite's CURRENT_TIMESTAMP is a UTC text like "2026-10-06 16:12:12". The app
+# compares and parses these as text, so Postgres stores the same text format.
+_NOW_TEXT = "to_char(timezone('utc', now()), 'YYYY-MM-DD HH24:MI:SS')"
+
+
+def _translate(sql, has_params):
+    s = sql
+    s = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "SERIAL PRIMARY KEY", s, flags=re.I)
+    s = re.sub(r"\bDATETIME\s+DEFAULT\s+CURRENT_TIMESTAMP\b",
+               "TEXT DEFAULT (" + _NOW_TEXT + ")", s, flags=re.I)
+    s = re.sub(r"\bDATETIME\b", "TEXT", s, flags=re.I)
+    s = re.sub(r"\bBLOB\b", "BYTEA", s, flags=re.I)
+    s = re.sub(r"=\s*CURRENT_TIMESTAMP\b", "= " + _NOW_TEXT, s, flags=re.I)
+
+    # INSERT OR IGNORE INTO ...  ->  INSERT INTO ... ON CONFLICT DO NOTHING
+    if re.match(r"\s*INSERT\s+OR\s+IGNORE\s+INTO", s, flags=re.I):
+        s = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", s, count=1, flags=re.I)
+        s = s.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+
+    # PRAGMA table_info(t) -> same shape of answer: (cid, name, ...)
+    m = re.match(r"\s*PRAGMA\s+table_info\(\s*(\w+)\s*\)\s*$", s, flags=re.I)
+    if m:
+        return ("SELECT ordinal_position - 1, column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = '%s' "
+                "ORDER BY ordinal_position" % m.group(1).lower())
+
+    if has_params:
+        s = s.replace("%", "%%").replace("?", "%s")
+    return s
+
+
+def _clean_params(params):
+    # SQLite stores True/False as 1/0; Postgres INTEGER columns need real ints.
+    return tuple(int(p) if isinstance(p, bool) else p for p in params)
+
+
+def _clean_row(row):
+    # Postgres returns BYTEA as memoryview; the app expects plain bytes.
+    return tuple(bytes(v) if isinstance(v, memoryview) else v for v in row)
+
+
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            _pool = ConnectionPool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=5,
+                kwargs={"autocommit": False, "prepare_threshold": None},
+                check=ConnectionPool.check_connection,
+                open=True,
+            )
+        return _pool
+
+
+class _PgCursor:
+    def __init__(self, conn):
+        self._conn = conn
+        self._cur = conn.cursor()
+
+    def execute(self, sql, params=None):
+        has_params = params is not None
+        try:
+            if has_params:
+                self._cur.execute(_translate(sql, True), _clean_params(params))
+            else:
+                self._cur.execute(_translate(sql, False))
+        except Exception:
+            # A failed statement leaves Postgres in an "aborted transaction"
+            # state. Roll back so the next statement (e.g. a retry after a
+            # duplicate join code) works, like it does in SQLite.
+            self._conn.rollback()
+            raise
+        return self
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return _clean_row(row) if row is not None else None
+
+    def fetchall(self):
+        return [_clean_row(r) for r in self._cur.fetchall()]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    @property
+    def lastrowid(self):
+        self._cur.execute("SELECT lastval()")
+        return self._cur.fetchone()[0]
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+
+class _PgConnection:
+    def __init__(self):
+        self._pool = _get_pool()
+        self._conn = self._pool.getconn()
+
+    def cursor(self):
+        return _PgCursor(self._conn)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        # Give the connection back to the pool. Anything not committed is
+        # rolled back, the same as closing an SQLite connection.
+        try:
+            self._conn.rollback()
+        finally:
+            self._pool.putconn(self._conn)
+
+
+def connect():
+    if USING_POSTGRES:
+        return _PgConnection()
+    return sqlite3.connect(SQLITE_FILE)
