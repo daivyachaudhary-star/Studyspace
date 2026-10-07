@@ -246,6 +246,7 @@ def init_db():
 
    add_column_if_missing("class_enrollment", "student_name", "TEXT DEFAULT ''")
    add_column_if_missing("class_enrollment", "status", "TEXT DEFAULT 'pending'")
+   add_column_if_missing("user_profile", "consent_at", "TEXT DEFAULT ''")
 
    # Older local databases were created before "email TEXT UNIQUE" was added to
    # the CREATE TABLE statement below — CREATE TABLE IF NOT EXISTS never retrofits
@@ -2353,8 +2354,12 @@ def render_onboarding_wizard():
 
 
    with card_col:
+       if st.session_state.pop("_deleted_notice", False):
+           st.success("Your account and data have been deleted.")
        if st.session_state.get("auth_mode") == "login":
            render_login_form()
+           with st.expander("Privacy notice"):
+               render_privacy_notice()
            return
 
        st.progress(min(step / total_steps, 1.0))
@@ -2562,6 +2567,10 @@ def render_onboarding_wizard():
            )
 
 
+       if step == 1:
+           with st.expander("Privacy notice: what StudySpace stores"):
+               render_privacy_notice()
+
        if step == 1 and not st.session_state["email_verified"]:
            if st.button(
                    "Already have an account? Log in",
@@ -2571,6 +2580,14 @@ def render_onboarding_wizard():
            ):
                st.session_state["auth_mode"] = "login"
                st.rerun()
+
+       if step == total_steps:
+           with st.expander("Read the Privacy Notice"):
+               render_privacy_notice()
+           st.checkbox(
+               "I have read the Privacy Notice and I agree to it.",
+               key="consent_privacy",
+           )
 
        btn_col1, btn_col2 = st.columns([1, 1])
        with btn_col1:
@@ -2585,7 +2602,12 @@ def render_onboarding_wizard():
                    st.session_state["wizard_step"] += 1
                    st.rerun()
            else:
-               if st.button("Complete Setup", use_container_width=True, key="btn_wizard_complete"):
+               if st.button(
+                       "Complete Setup",
+                       use_container_width=True,
+                       key="btn_wizard_complete",
+                       disabled=not st.session_state.get("consent_privacy", False),
+               ):
                    fd = st.session_state["form_data"]
                    user_e = fd["email"].strip().lower()
                    if fetch_user_profile(user_e):
@@ -2602,6 +2624,7 @@ def render_onboarding_wizard():
                        fd.get("grade", ""),
                        "freemium",
                    )
+                   record_consent(user_e)
                    st.session_state["active_email"] = user_e
                    st.session_state["is_logged_in"] = True
                    start_remembered_session(user_e)
@@ -3323,6 +3346,205 @@ def render_onesignal_web_push_snippet(user_email):
    )
 
 
+# =========================================================
+# PRIVACY, CONSENT, DATA DOWNLOAD AND ACCOUNT DELETION
+# =========================================================
+# Who people can contact about their data. Change this text if it changes.
+PRIVACY_CONTACT = "the creator of StudySpace (Daivya Chaudhary, TIK) or your teacher or supervisor at school"
+
+PRIVACY_NOTICE_MD = f"""
+**StudySpace is a school project** (an MYP Personal Project at TIK). It is a prototype made by a student, not a company.
+
+**What StudySpace stores about you**
+- **Account:** your name, email, whether you are a student or teacher, your grade, your main goal, your subjects and your study schedule.
+- **What you do in the app:** your chats with the AI tutor and any homework photos you upload, topics saved from your questions (you can switch this off in the sidebar), study logs, quiz results, reminders and a daily usage counter.
+- **Classes:** the classes you create or join, join requests, homework and test dates. A teacher can see the name and email of students in their class.
+- **Staying logged in:** if you stay logged in, only a scrambled (hashed) token is stored, for up to 30 days. Login codes stop working after 10 minutes.
+
+**Why:** to give you the tutor, homework planner, reminders and classes. You agree to this when you create your account.
+
+**Who else handles your data**
+- **Google (Gemini):** your messages and any photos you upload are sent to Google's Gemini AI to write the answers. On free plans, Google's terms may let it use this content to improve its products, so do not upload anything private.
+- **Supabase:** the database that stores your data. The servers are in the EU (Ireland).
+- **Streamlit Community Cloud:** hosts the app.
+- **Gmail (Google):** sends your login code by email.
+- **OneSignal:** if notifications are on, your email is attached to your browser so reminders can reach you.
+
+**How long:** until you delete your account. You can do that in this window, under "Delete my account".
+
+**Your choices**
+- **See or download your data:** use the "Download my data" tab.
+- **Correct your details:** use "Edit My Profile" in the sidebar.
+- **Delete everything:** use the "Delete my account" tab. This removes your data from StudySpace's database. Data already held by OneSignal or sent to Google is handled under their own rules.
+- **Questions or requests:** ask {PRIVACY_CONTACT}.
+- **Complaints:** in Estonia you can contact the Data Protection Inspectorate (Andmekaitse Inspektsioon).
+
+**Age:** if you are younger than the age at which you may agree to online services in your country, ask a parent or guardian before signing up.
+"""
+
+
+def render_privacy_notice():
+    st.markdown(PRIVACY_NOTICE_MD)
+
+
+def record_consent(email):
+    """Stores when the person ticked the privacy box at sign-up."""
+    now_txt = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    conn = db.connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE user_profile SET consent_at = ? WHERE LOWER(email) = ?",
+        (now_txt, email.lower().strip()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def export_user_data(email):
+    """Everything StudySpace holds about this person, as a plain dict (for JSON download)."""
+    e = email.lower().strip()
+    conn = db.connect()
+    cursor = conn.cursor()
+
+    def grab(sql, params, cols):
+        cursor.execute(sql, params)
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    out = {"exported_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+           "email": e}
+    out["profile"] = grab(
+        "SELECT name, email, purpose, interests, schedule, tier, role, grade, consent_at "
+        "FROM user_profile WHERE LOWER(email) = ?", (e,),
+        ["name", "email", "purpose", "interests", "schedule", "tier", "role", "grade", "consent_at"])
+    out["study_logs"] = grab("SELECT topic, timestamp FROM study_logs WHERE LOWER(email) = ?", (e,),
+                             ["topic", "timestamp"])
+    out["quiz_results"] = grab("SELECT subject, score, total, timestamp FROM quiz_results WHERE LOWER(email) = ?",
+                               (e,), ["subject", "score", "total", "timestamp"])
+    out["daily_usage"] = grab("SELECT date_str, count FROM daily_rpd_usage WHERE LOWER(email) = ?", (e,),
+                              ["date", "count"])
+    out["reminders"] = grab("SELECT title, due_at, created_at FROM reminders WHERE LOWER(user_email) = ?", (e,),
+                            ["title", "due_at", "created_at"])
+    out["saved_topics"] = grab(
+        "SELECT subject, topic, specific_area, raw_text, timestamp FROM knowledge_items WHERE LOWER(email) = ?",
+        (e,), ["subject", "topic", "specific_area", "raw_text", "timestamp"])
+    out["class_memberships"] = grab(
+        "SELECT class_id, student_name, status FROM class_enrollment WHERE LOWER(student_email) = ?", (e,),
+        ["class_id", "student_name", "status"])
+    out["dismissed_notifications"] = grab(
+        "SELECT notif_type, ref_id, dismissed_at FROM notification_dismissals WHERE LOWER(student_email) = ?",
+        (e,), ["type", "ref_id", "dismissed_at"])
+
+    chats = grab("SELECT id, title, created_at, updated_at FROM chat_sessions WHERE LOWER(email) = ?", (e,),
+                 ["id", "title", "created_at", "updated_at"])
+    for c in chats:
+        cursor.execute(
+            "SELECT role, content, image_data, mime_type, created_at FROM chat_messages "
+            "WHERE session_id = ? ORDER BY id", (c["id"],))
+        msgs = []
+        for role, content, image_data, mime_type, created_at in cursor.fetchall():
+            m = {"role": role, "content": content, "created_at": created_at}
+            if image_data:
+                m["image_mime_type"] = mime_type
+                m["image_base64"] = base64.b64encode(bytes(image_data)).decode("ascii")
+            msgs.append(m)
+        c["messages"] = msgs
+    out["chats"] = chats
+
+    classes = grab("SELECT id, class_name, join_code, created_at FROM classes WHERE LOWER(teacher_email) = ?",
+                   (e,), ["id", "class_name", "join_code", "created_at"])
+    for c in classes:
+        cursor.execute("SELECT title, topic, due_date FROM assignments WHERE class_id = ?", (c["id"],))
+        c["homework"] = [dict(zip(["title", "topic", "due_date"], r)) for r in cursor.fetchall()]
+        cursor.execute("SELECT test_title, subject, topic, test_date FROM class_tests WHERE class_id = ?", (c["id"],))
+        c["tests"] = [dict(zip(["title", "subject", "topic", "date"], r)) for r in cursor.fetchall()]
+    out["classes_i_teach"] = classes
+    conn.close()
+    return out
+
+
+def delete_user_account(email):
+    """Permanently removes everything StudySpace stores about this person. All-or-nothing."""
+    e = email.lower().strip()
+    conn = db.connect()
+    cursor = conn.cursor()
+    steps = [
+        ("DELETE FROM chat_messages WHERE session_id IN (SELECT id FROM chat_sessions WHERE LOWER(email) = ?)", (e,)),
+        ("DELETE FROM chat_sessions WHERE LOWER(email) = ?", (e,)),
+        ("DELETE FROM study_logs WHERE LOWER(email) = ?", (e,)),
+        ("DELETE FROM quiz_results WHERE LOWER(email) = ?", (e,)),
+        ("DELETE FROM daily_rpd_usage WHERE LOWER(email) = ?", (e,)),
+        ("DELETE FROM reminders WHERE LOWER(user_email) = ?", (e,)),
+        ("DELETE FROM knowledge_items WHERE LOWER(email) = ?", (e,)),
+        ("DELETE FROM login_tokens WHERE LOWER(email) = ?", (e,)),
+        ("DELETE FROM notification_dismissals WHERE LOWER(student_email) = ?", (e,)),
+        ("DELETE FROM class_enrollment WHERE LOWER(student_email) = ?", (e,)),
+        # Classes this person created as a teacher, and everything inside them
+        ("DELETE FROM class_tests WHERE class_id IN (SELECT id FROM classes WHERE LOWER(teacher_email) = ?)", (e,)),
+        ("DELETE FROM assignments WHERE class_id IN (SELECT id FROM classes WHERE LOWER(teacher_email) = ?)", (e,)),
+        ("DELETE FROM class_enrollment WHERE class_id IN (SELECT id FROM classes WHERE LOWER(teacher_email) = ?)", (e,)),
+        ("DELETE FROM classes WHERE LOWER(teacher_email) = ?", (e,)),
+        ("DELETE FROM user_profile WHERE LOWER(email) = ?", (e,)),
+    ]
+    try:
+        for sql, params in steps:
+            cursor.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@st.dialog("Privacy & My Data", width="large")
+def render_privacy_and_data_dialog(profile):
+    user_email = profile["email"]
+    is_teacher = profile.get("role", "student") == "teacher"
+    tab_notice, tab_download, tab_delete = st.tabs(["Privacy notice", "Download my data", "Delete my account"])
+
+    with tab_notice:
+        render_privacy_notice()
+
+    with tab_download:
+        st.write("Download a copy of the information StudySpace stores about you (including your chats and any "
+                 "photos you uploaded) as a JSON file.")
+        try:
+            payload = json.dumps(export_user_data(user_email), indent=2, default=str)
+            st.download_button(
+                "Download my data (.json)",
+                data=payload,
+                file_name="my_studyspace_data.json",
+                mime="application/json",
+                use_container_width=True,
+                key="btn_download_my_data",
+            )
+        except Exception as ex:
+            st.error(f"Couldn't prepare your data: {ex}")
+
+    with tab_delete:
+        st.warning(
+            "This permanently deletes your account and everything StudySpace stores about you: profile, chats, "
+            "photos, reminders, quiz results and class memberships. It cannot be undone."
+        )
+        if is_teacher:
+            st.warning("You are a teacher: your classes, homework and test dates will be deleted too, and your "
+                       "students will lose access to them.")
+        st.caption("Tip: use the Download tab first if you want a copy.")
+        typed = st.text_input("To confirm, type DELETE", key="delete_confirm_text")
+        if st.button("Delete my account permanently", type="primary", use_container_width=True,
+                     disabled=(typed.strip() != "DELETE"), key="btn_delete_account"):
+            try:
+                delete_user_account(user_email)
+            except Exception as ex:
+                st.error(f"Couldn't delete your account: {ex}")
+            else:
+                token = st.session_state.get("_remember_token") or read_remember_cookie()
+                if token:
+                    delete_login_token(token)
+                st.session_state.clear()
+                st.session_state["_clear_cookie"] = True
+                st.session_state["_deleted_notice"] = True
+                st.rerun()
+
+
+
 def main():
    if "account_action" in st.session_state:
        action, target_email = st.session_state.pop("account_action")
@@ -3658,6 +3880,9 @@ def main():
 
        if st.button("Edit My Profile", use_container_width=True, key="btn_edit_profile"):
            render_edit_profile_dialog(active_profile)
+
+       if st.button("Privacy & My Data", use_container_width=True, key="btn_privacy_data"):
+           render_privacy_and_data_dialog(active_profile)
 
        if st.button("Log Out", use_container_width=True, key="btn_logout"):
            st.session_state["account_action"] = ("signout", None)
