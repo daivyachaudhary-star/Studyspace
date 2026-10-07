@@ -3313,7 +3313,7 @@ def render_tutor(profile):
        chosen_mode = stage_to_mode[next_help_stage]
 
        with st.chat_message("assistant"):
-           with st.spinner("Analyzing screenshot and thinking..."):
+           with st.spinner("Analyzing screenshot and thinking..." if image_bytes else "Thinking..."):
                reply = generate_ai_response(
                    prompt,
                    image_bytes=image_bytes,
@@ -3692,12 +3692,33 @@ def main():
            logo_img_tag = ""
 
 
+       # The StudySpace logo IS the Home button. It is a real Streamlit button (no page reload,
+       # so no new session and no sign-up flash) styled to look like the logo block.
+       if logo_path:
+           st.markdown(
+               "<style>.st-key-btn_home button {"
+               f"background-image: url('data:image/png;base64,{b64_logo}') !important;"
+               "background-repeat: no-repeat !important;"
+               "background-position: 14px center !important;"
+               "background-size: auto 26px !important;"
+               "padding-left: 56px !important;}</style>",
+               unsafe_allow_html=True,
+           )
        st.markdown(
-           f'<div class="sidebar-logo-button">{logo_img_tag}<span>StudySpace</span></div>',
+           "<style>.st-key-btn_home button {"
+           "justify-content: flex-start !important;"
+           "background-color: #f1f5f9 !important;"
+           "border: 1px solid #cbd5e1 !important;"
+           "border-radius: 12px !important;"
+           "min-height: 46px !important;}"
+           ".st-key-btn_home button > div {justify-content: flex-start !important; width: 100% !important; padding-left: 42px !important;}"
+           ".st-key-btn_home button p {font-weight: 700 !important; font-size: 1rem !important;"
+           "text-align: left !important;}"
+           ".st-key-btn_home button:hover {background-color: #e2e8f0 !important;"
+           "border-color: #94a3b8 !important;}</style>",
            unsafe_allow_html=True,
        )
-
-       if st.button("Home", use_container_width=True, key="btn_home"):
+       if st.button("StudySpace", use_container_width=True, key="btn_home"):
            st.session_state["page"] = "Home"
            st.rerun()
 
