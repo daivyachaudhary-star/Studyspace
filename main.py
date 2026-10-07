@@ -260,6 +260,24 @@ def init_db():
 
 
 
+# ---------------------------------------------------------------------------
+# Fewer database round trips. With the online database, every query costs about 0.1 s of waiting,
+# and one click used to ask the same questions (profile, usage count, chat list) several times.
+# This remembers an answer for the rest of ONE script run, and forgets it as soon as anything is saved.
+# ---------------------------------------------------------------------------
+def _run_cached(key, fn):
+    if not db.USING_POSTGRES:
+        return fn()
+    import copy
+    cache = st.session_state.setdefault("_run_cache", {})
+    hit = cache.get(key)
+    if hit is not None and hit[0] == db.write_count():
+        return copy.deepcopy(hit[1])
+    val = fn()
+    cache[key] = (db.write_count(), copy.deepcopy(val))
+    return val
+
+
 def store_knowledge_item(email, subject, topic, specific_area, raw_text):
    conn = db.connect()
    cursor = conn.cursor()
@@ -322,7 +340,7 @@ def add_class_test(class_id, test_title, subject, topic, test_date):
 
 
 
-def get_current_rpd_count(email):
+def _get_current_rpd_count_uncached(email):
    conn = db.connect()
    cursor = conn.cursor()
    today_str = datetime.date.today().isoformat()
@@ -509,6 +527,8 @@ def read_bridge_token():
        value = _cookie_bridge(key="cookie_bridge", default=None)
    except Exception:
        return None
+   if isinstance(value, dict):
+       st.session_state["_bridge_answered"] = True
    token = value.get("token") if isinstance(value, dict) else None
    return token if isinstance(token, str) and token else None
 
@@ -673,7 +693,7 @@ def fetch_all_profiles():
 
 
 
-def fetch_user_profile(email=None):
+def _fetch_user_profile_uncached(email=None):
    if not email:
        return None
    conn = db.connect()
@@ -782,7 +802,7 @@ def save_chat_message(session_id, role, content, image_bytes=None, mime_type=Non
    touch_chat_session(session_id)
 
 
-def get_recent_chat_sessions(email, limit=10):
+def _get_recent_chat_sessions_uncached(email, limit=10):
    conn = db.connect()
    cursor = conn.cursor()
    cursor.execute(
@@ -863,6 +883,18 @@ def resume_chat_session(session_id):
    st.session_state["current_chat_session_id"] = session_id
    st.session_state["page"] = "AI Tutor"
    st.rerun()
+
+
+def fetch_user_profile(email=None):
+    return _run_cached(("profile", email), lambda: _fetch_user_profile_uncached(email))
+
+
+def get_current_rpd_count(email):
+    return _run_cached(("rpd", email), lambda: _get_current_rpd_count_uncached(email))
+
+
+def get_recent_chat_sessions(email, limit=10):
+    return _run_cached(("chats", email, limit), lambda: _get_recent_chat_sessions_uncached(email, limit))
 
 
 def fetch_quiz_results(email=None):
@@ -3541,11 +3573,14 @@ def render_privacy_and_data_dialog(profile):
                 st.session_state.clear()
                 st.session_state["_clear_cookie"] = True
                 st.session_state["_deleted_notice"] = True
+                st.session_state["_bridge_skip"] = True
                 st.rerun()
 
 
 
 def main():
+   st.session_state["_run_cache"] = {}
+
    if "account_action" in st.session_state:
        action, target_email = st.session_state.pop("account_action")
        if action == "add":
@@ -3569,6 +3604,7 @@ def main():
            delete_login_token(st.session_state.get("_remember_token") or read_remember_cookie())
            st.session_state.clear()
            st.session_state["_clear_cookie"] = True
+           st.session_state["_bridge_skip"] = True      # signed out on purpose: no need to wait for the browser
            st.rerun()
 
    # Returning visitor with a valid "stay logged in" cookie: log them in without an OTP.
@@ -3604,6 +3640,20 @@ def main():
            height=24,
        )
 
+
+   # On a fresh page load the browser has not yet told us whether it holds a "stay logged in" cookie.
+   # Show a short loading line instead of flashing the sign-up page, then carry on as soon as it answers.
+   if (
+       not st.session_state.get("active_email")
+       and _cookie_bridge is not None
+       and not st.session_state.get("_bridge_answered")
+       and not st.session_state.get("_bridge_skip")
+   ):
+       st.caption("Loading StudySpace...")
+       if st.button("Taking too long? Continue to sign in", type="tertiary", key="btn_bridge_skip"):
+           st.session_state["_bridge_skip"] = True
+           st.rerun()
+       st.stop()
 
    current_active = st.session_state.get("active_email")
    active_profile = fetch_user_profile(current_active) if current_active else None
@@ -3643,9 +3693,13 @@ def main():
 
 
        st.markdown(
-           f'<a href="?nav=home" target="_self" class="sidebar-logo-button">{logo_img_tag}<span>StudySpace</span></a>',
+           f'<div class="sidebar-logo-button">{logo_img_tag}<span>StudySpace</span></div>',
            unsafe_allow_html=True,
        )
+
+       if st.button("Home", use_container_width=True, key="btn_home"):
+           st.session_state["page"] = "Home"
+           st.rerun()
 
 
        st.write("---")

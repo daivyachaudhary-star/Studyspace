@@ -88,40 +88,82 @@ def _clean_row(row):
 
 _pool = None
 _pool_lock = threading.Lock()
+_write_count = 0          # bumped on every commit, so main.py can tell when cached reads may be stale
+
+
+def write_count():
+    return _write_count
 
 
 def _get_pool():
     global _pool
     with _pool_lock:
         if _pool is None:
+            # Speed: the database is far from the app, so every extra round trip costs ~0.1 s.
+            #  - no connection check on every checkout (a stale connection is replaced and retried instead)
+            #  - autocommit for plain reads, so a SELECT needs no BEGIN / ROLLBACK round trips
             _pool = ConnectionPool(
                 DATABASE_URL,
                 min_size=1,
                 max_size=5,
-                kwargs={"autocommit": False, "prepare_threshold": None},
-                check=ConnectionPool.check_connection,
+                kwargs={
+                    "autocommit": True,
+                    "prepare_threshold": None,
+                    "connect_timeout": 10,
+                    "keepalives": 1,
+                    "keepalives_idle": 20,
+                    "keepalives_interval": 5,
+                    "keepalives_count": 3,
+                },
                 open=True,
             )
         return _pool
 
 
+_STALE_ERRORS = (psycopg.OperationalError, psycopg.InterfaceError) if USING_POSTGRES else ()
+
+
 class _PgCursor:
-    def __init__(self, conn):
-        self._conn = conn
-        self._cur = conn.cursor()
+    def __init__(self, parent):
+        self._p = parent
+        self._cur = parent._conn.cursor()
+
+    def _run(self, sql, params):
+        p = self._p
+        # Reads run in autocommit (no transaction). Anything else opens a real transaction first,
+        # which commit() / rollback() then ends, like SQLite.
+        is_read = sql.lstrip()[:6].upper() == "SELECT"
+        if not is_read and not p._in_tx:
+            self._cur.execute("BEGIN")
+            p._in_tx = True
+        if params is None:
+            self._cur.execute(sql)
+        else:
+            self._cur.execute(sql, params)
 
     def execute(self, sql, params=None):
-        has_params = params is not None
+        p = self._p
+        tsql = _translate(sql, params is not None)
+        tparams = _clean_params(params) if params is not None else None
         try:
-            if has_params:
-                self._cur.execute(_translate(sql, True), _clean_params(params))
-            else:
-                self._cur.execute(_translate(sql, False))
+            attempts = 0
+            while True:
+                try:
+                    self._run(tsql, tparams)
+                    break
+                except _STALE_ERRORS:
+                    # The pooled connection went stale (idle too long, or the database restarted).
+                    # If nothing is pending, swap it for a fresh one and try again (a few times).
+                    attempts += 1
+                    if p._in_tx or attempts > 3:
+                        raise               # mid-transaction: never replay half a transaction
+                    p._in_tx = False
+                    p._replace_conn()
+                    self._cur = p._conn.cursor()
         except Exception:
-            # A failed statement leaves Postgres in an "aborted transaction"
-            # state. Roll back so the next statement (e.g. a retry after a
-            # duplicate join code) works, like it does in SQLite.
-            self._conn.rollback()
+            # A failed statement inside a transaction leaves Postgres "aborted". Roll back so the
+            # next statement (e.g. a retry after a duplicate join code) works, like SQLite.
+            p.rollback()
             raise
         return self
 
@@ -149,23 +191,46 @@ class _PgConnection:
     def __init__(self):
         self._pool = _get_pool()
         self._conn = self._pool.getconn()
+        self._in_tx = False
+
+    def _replace_conn(self):
+        old = self._conn
+        try:
+            self._pool.putconn(old)         # a broken connection is discarded by the pool
+        except Exception:
+            pass
+        self._conn = self._pool.getconn()
 
     def cursor(self):
-        return _PgCursor(self._conn)
+        return _PgCursor(self)
 
     def commit(self):
-        self._conn.commit()
+        global _write_count
+        if self._in_tx:
+            self._conn.commit()
+            self._in_tx = False
+        _write_count += 1
 
     def rollback(self):
-        self._conn.rollback()
+        try:
+            if self._in_tx or self._conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+                self._conn.rollback()
+        except Exception:
+            pass
+        self._in_tx = False
 
     def close(self):
-        # Give the connection back to the pool. Anything not committed is
-        # rolled back, the same as closing an SQLite connection.
+        # Give the connection back to the pool. Anything not committed is rolled back, the same
+        # as closing an SQLite connection.
         try:
-            self._conn.rollback()
+            self.rollback()
         finally:
             self._pool.putconn(self._conn)
+
+
+if not USING_POSTGRES:
+    def write_count():
+        return 0
 
 
 def connect():
