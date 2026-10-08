@@ -50,7 +50,7 @@ def _int_secret(name, default):
 
 
 # Free students get FREE_RPD questions a day (change in secrets without editing code).
-_FREE_RPD = _int_secret("FREE_RPD", 15)
+_FREE_RPD = _int_secret("FREE_RPD", 25)
 # Optional cap on ALL questions the app sends to Gemini per day (0 = off).
 # Set it to a bit under the daily total shown for your models in Google AI Studio.
 GLOBAL_DAILY_CAP = _int_secret("GLOBAL_DAILY_CAP", 0)
@@ -1528,7 +1528,7 @@ def start_reminder_scheduler():
 # ---- Gemini model fallback + friendly rate-limit messages -------------------
 # Google counts free-tier quota PER MODEL, so when the main model's daily
 # allowance is used up, the next model in the list still has its own allowance.
-_DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+_DEFAULT_MODELS = ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]
 
 
 def _model_chain():
@@ -1584,7 +1584,10 @@ def _generate_with_fallback(client, contents, config=None):
                 kwargs = {"model": model, "contents": contents}
                 if config is not None:
                     kwargs["config"] = config
-                return client.models.generate_content(**kwargs).text, None
+                _t0 = time.time()
+                _text = client.models.generate_content(**kwargs).text
+                print(f"[gemini] ANSWERED model={model} seconds={time.time() - _t0:.1f}", flush=True)
+                return _text, None
             except Exception as e:  # noqa: BLE001
                 last_err = str(e)
                 print(f"[gemini] model={model} attempt={attempt} error={last_err[:400]}", flush=True)
@@ -2231,7 +2234,7 @@ def render_upgrade_dialog(profile):
               <hr style="margin: 14px 0;">
               <ul style="text-align: left; font-size: 0.85rem; padding-left: 20px; color: #334155; line-height: 1.6;">
                   <li><b>22 RPD</b> (Requests Per Day)</li>
-                  <li>Powered by Gemini 3.8 Flash</li>
+                  <li>Powered by Google Gemma 4</li>
               </ul>
           </div>
       """.replace("<b>22 RPD</b>", f"<b>{_FREE_RPD} RPD</b>"),
@@ -2254,7 +2257,7 @@ def render_upgrade_dialog(profile):
               <hr style="margin: 14px 0;">
               <ul style="text-align: left; font-size: 0.85rem; padding-left: 20px; color: #334155; line-height: 1.6;">
                   <li><b>100 RPD</b> (Requests Per Day)</li>
-                  <li>Powered by Gemini 3.8 Flash</li>
+                  <li>Powered by Google Gemma 4</li>
               </ul>
           </div>
       """,
