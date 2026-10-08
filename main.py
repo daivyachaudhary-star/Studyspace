@@ -39,15 +39,32 @@ EMAIL_ADDRESS = st.secrets.get("EMAIL_ADDRESS", "")
 EMAIL_PASSWORD = st.secrets.get("EMAIL_PASSWORD", "")
 
 
+def _int_secret(name, default):
+   try:
+      return int(st.secrets.get(name, default))
+   except Exception:
+      try:
+         return int(os.environ.get(name, default))
+      except Exception:
+         return default
+
+
+# Free students get FREE_RPD questions a day (change in secrets without editing code).
+_FREE_RPD = _int_secret("FREE_RPD", 15)
+# Optional cap on ALL questions the app sends to Gemini per day (0 = off).
+# Set it to a bit under the daily total shown for your models in Google AI Studio.
+GLOBAL_DAILY_CAP = _int_secret("GLOBAL_DAILY_CAP", 0)
+
+
 TIER_LIMITS = {
-   "freemium": 22,
+   "freemium": _FREE_RPD,
    "pro": 100,
    "pro_plus": 200,
 }
 
 
 TIER_CONFIG = {
-   "freemium": {"limit": 22, "sections": 4},
+   "freemium": {"limit": _FREE_RPD, "sections": 4},
    "pro": {"limit": 100, "sections": 8},
    "pro_plus": {"limit": 200, "sections": 12},
 }
@@ -369,7 +386,7 @@ def check_and_increment_rpd(email, user_tier):
    current_count = row[0] if row else 0
 
 
-   max_limit = TIER_LIMITS.get(user_tier.lower(), 22)
+   max_limit = TIER_LIMITS.get(user_tier.lower(), _FREE_RPD)
 
 
    if current_count >= max_limit:
@@ -393,6 +410,56 @@ def check_and_increment_rpd(email, user_tier):
    conn.close()
    return True
 
+
+
+
+def refund_rpd(email):
+   """Give a student their request back when Gemini failed (so errors don't burn their allowance)."""
+   try:
+      conn = db.connect()
+      cursor = conn.cursor()
+      cursor.execute(
+         "UPDATE daily_rpd_usage SET count = count - 1 WHERE LOWER(email) = ? AND date_str = ? AND count > 0",
+         (email.lower().strip(), datetime.date.today().isoformat()),
+      )
+      conn.commit()
+      conn.close()
+   except Exception as e:  # noqa: BLE001
+      print(f"[rpd] refund failed: {e}", flush=True)
+
+
+def _google_day():
+   # Google resets free-tier daily quota at midnight US Pacific time, so the shared counter follows that clock.
+   return datetime.datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()
+
+
+def _global_used_today():
+   try:
+      conn = db.connect()
+      cursor = conn.cursor()
+      cursor.execute("SELECT count FROM daily_rpd_usage WHERE email = ? AND date_str = ?", ("__global__", _google_day()))
+      row = cursor.fetchone()
+      conn.close()
+      return row[0] if row else 0
+   except Exception as e:  # noqa: BLE001
+      print(f"[rpd] global read failed: {e}", flush=True)
+      return 0
+
+
+def _global_add():
+   try:
+      conn = db.connect()
+      cursor = conn.cursor()
+      today = _google_day()
+      cursor.execute("SELECT count FROM daily_rpd_usage WHERE email = ? AND date_str = ?", ("__global__", today))
+      if cursor.fetchone():
+         cursor.execute("UPDATE daily_rpd_usage SET count = count + 1 WHERE email = ? AND date_str = ?", ("__global__", today))
+      else:
+         cursor.execute("INSERT INTO daily_rpd_usage (email, date_str, count) VALUES (?, ?, 1)", ("__global__", today))
+      conn.commit()
+      conn.close()
+   except Exception as e:  # noqa: BLE001
+      print(f"[rpd] global add failed: {e}", flush=True)
 
 
 
@@ -1458,6 +1525,77 @@ def start_reminder_scheduler():
 # =========================================================
 # AI RESPONSE & TOPIC EXTRACTION ENGINE (WITH RETRY LOGIC)
 # =========================================================
+# ---- Gemini model fallback + friendly rate-limit messages -------------------
+# Google counts free-tier quota PER MODEL, so when the main model's daily
+# allowance is used up, the next model in the list still has its own allowance.
+_DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+
+
+def _model_chain():
+    """Models to try, in order. Can be overridden with GEMINI_MODELS in secrets
+    (comma separated), e.g. GEMINI_MODELS = "gemini-3.8-flash,gemini-3.8-flash-lite"."""
+    raw = ""
+    try:
+        raw = st.secrets.get("GEMINI_MODELS", "") or ""
+    except Exception:
+        raw = ""
+    raw = raw or os.environ.get("GEMINI_MODELS", "")
+    chain = [m.strip() for m in raw.split(",") if m.strip()]
+    return chain or list(_DEFAULT_MODELS)
+
+
+def _is_rate_limited(msg):
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg
+
+
+def _is_model_missing(msg):
+    return "404" in msg or "NOT_FOUND" in msg
+
+
+def _retry_seconds(msg):
+    m = re.search(r"retryDelay['\"]?:\s*['\"]?(\d+(?:\.\d+)?)", msg) or \
+        re.search(r"retry in (\d+(?:\.\d+)?)\s*s", msg)
+    return int(float(m.group(1))) if m else None
+
+
+def _friendly_wait(msg):
+    secs = _retry_seconds(msg)
+    daily = "PerDay" in msg or "per day" in msg.lower() or (secs is not None and secs > 300)
+    if secs is None:
+        when = "a minute"
+    elif secs < 90:
+        when = f"{max(secs, 5)} seconds"
+    elif secs < 5400:
+        when = f"about {round(secs / 60)} minutes"
+    else:
+        when = f"about {round(secs / 3600)} hours"
+    if daily:
+        return ("StudySpace has used up its free AI allowance for today, so the tutor is resting. "
+                f"It should work again in {when}. Your questions are not lost.")
+    return f"The tutor is getting a lot of requests right now. Please wait {when} and try again."
+
+
+def _generate_with_fallback(client, contents, config=None):
+    """Try each model in turn. Returns (text, None) or (None, last_error_text)."""
+    last_err = ""
+    for model in _model_chain():
+        for attempt in range(3):
+            try:
+                kwargs = {"model": model, "contents": contents}
+                if config is not None:
+                    kwargs["config"] = config
+                return client.models.generate_content(**kwargs).text, None
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                print(f"[gemini] model={model} attempt={attempt} error={last_err[:400]}", flush=True)
+                if ("503" in last_err or "UNAVAILABLE" in last_err) and attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                break  # 429 / 404 / other: go to the next model
+    return None, last_err
+
+
+
 def extract_and_store_topic_details(prompt, image_bytes, mime_type, user_email):
    if not user_email:
        return
@@ -1586,13 +1724,21 @@ def generate_ai_response(
 
    if user_email:
        if not check_and_increment_rpd(user_email, user_tier):
-           max_limit = TIER_LIMITS.get(user_tier.lower(), 22)
+           max_limit = TIER_LIMITS.get(user_tier.lower(), _FREE_RPD)
            return (
                f"Daily RPD Limit Reached\n\n"
                f"You have used all {max_limit} requests available for today on the {user_tier.upper()} plan. "
                "Please upgrade your plan or wait until tomorrow to continue."
            )
 
+
+   # Shared daily budget: stop before Google rejects us, and give the student their request back.
+   if user_email and GLOBAL_DAILY_CAP and _global_used_today() >= GLOBAL_DAILY_CAP:
+       refund_rpd(user_email)
+       return (
+           "StudySpace has used up its shared AI allowance for today, so the tutor is resting. "
+           "Please try again tomorrow. Your questions are not lost."
+       )
 
    api_key = None
    try:
@@ -1702,29 +1848,19 @@ def generate_ai_response(
        )
 
 
-   # Added Exponential Backoff Retry Loop to resolve 503 UNAVAILABLE errors
-   max_retries = 4
-   for attempt in range(max_retries):
-       try:
-           response = client.models.generate_content(
-               model=selected_model, contents=contents, config=config
-           )
-           return response.text
-       except Exception as e:
-           error_msg = str(e)
-           if ("503" in error_msg or "UNAVAILABLE" in error_msg) and attempt < max_retries - 1:
-               time.sleep(2 * (attempt + 1))
-               continue
-           if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-               retry_match = re.search(r"retryDelay['\"]?:\s*['\"]?(\d+)", error_msg)
-               wait_s = retry_match.group(1) if retry_match else "a few"
-               return (
-                   f"The tutor is getting a lot of requests right now — please wait "
-                   f"{wait_s} seconds and try again."
-               )
-           if "503" in error_msg or "UNAVAILABLE" in error_msg:
-               return "Please try again in about 20 seconds — the tutor is briefly unavailable."
-           return f"Error communicating with AI: {error_msg}"
+   # Try the main model first, then fall back to the others (each has its own quota)
+   text, err = _generate_with_fallback(client, contents, config)
+   if text is not None:
+       if user_email:
+           _global_add()
+       return text
+   if user_email:
+       refund_rpd(user_email)   # Gemini failed, so don't charge the student a request
+   if _is_rate_limited(err):
+       return _friendly_wait(err)
+   if "503" in err or "UNAVAILABLE" in err:
+       return "Please try again in about 20 seconds. The tutor is briefly unavailable."
+   return f"Error communicating with AI: {err}"
 
 
 
@@ -2094,7 +2230,7 @@ def render_upgrade_dialog(profile):
                   <li>Powered by Gemini 3.8 Flash</li>
               </ul>
           </div>
-      """,
+      """.replace("<b>22 RPD</b>", f"<b>{_FREE_RPD} RPD</b>"),
            unsafe_allow_html=True,
        )
        st.button(
