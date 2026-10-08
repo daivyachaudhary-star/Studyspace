@@ -1725,10 +1725,14 @@ def generate_ai_response(
    if user_email:
        if not check_and_increment_rpd(user_email, user_tier):
            max_limit = TIER_LIMITS.get(user_tier.lower(), _FREE_RPD)
+           if user_tier.lower() == "freemium":
+               return (
+                   "Your free limit for today has ended. To continue chatting you can "
+                   "upgrade your plan, or please wait until tomorrow."
+               )
            return (
-               f"Daily RPD Limit Reached\n\n"
-               f"You have used all {max_limit} requests available for today on the {user_tier.upper()} plan. "
-               "Please upgrade your plan or wait until tomorrow to continue."
+               "Your daily limit for today has ended. To continue chatting you can "
+               "upgrade your plan, or please wait until tomorrow."
            )
 
 
