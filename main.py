@@ -3478,26 +3478,10 @@ def render_home_page(profile):
                        b1, b2 = st.columns(2)
                        with b1:
                            if st.button("Practice test", key=f"study_test_{row_start}_{_k}", use_container_width=True):
-                               with st.spinner(f"Making your {_label} practice test..."):
-                                   _res = generate_mock_test_from_memory(user_email, target_subject=subj["name"])
-                               st.session_state["messages"] = [
-                                   {"role": "user", "content": f"Study for a test: {_label} (practice test)"},
-                                   {"role": "assistant", "content": _res, "help_stage": 3},
-                               ]
-                               start_new_chat_session(user_email, st.session_state["messages"])
-                               st.session_state["page"] = "AI Tutor"
-                               st.rerun()
+                               _open_study_chat(user_email, subj["name"], _label, "test")
                        with b2:
                            if st.button("Study notes", key=f"study_notes_{row_start}_{_k}", use_container_width=True):
-                               with st.spinner(f"Making your {_label} study notes..."):
-                                   _res = generate_study_notes_from_memory(user_email, target_subject=subj["name"])
-                               st.session_state["messages"] = [
-                                   {"role": "user", "content": f"Study for a test: {_label} (study notes)"},
-                                   {"role": "assistant", "content": _res, "help_stage": 3},
-                               ]
-                               start_new_chat_session(user_email, st.session_state["messages"])
-                               st.session_state["page"] = "AI Tutor"
-                               st.rerun()
+                               _open_study_chat(user_email, subj["name"], _label, "notes")
    st.caption("Each practice test or set of notes uses 1 of your daily requests.")
 
    sw1, sw2, sw3 = st.columns(3)
@@ -3524,7 +3508,7 @@ def _reply_job_store():
    return {"lock": threading.Lock(), "jobs": {}}
 
 
-def _start_reply_job(chat_session_id, user_email, prompt, help_stage, ai_kwargs):
+def _start_reply_job(chat_session_id, user_email, prompt, help_stage, ai_kwargs=None, producer=None):
    store = _reply_job_store()
    job_id = _token_urlsafe(8)
    job = {
@@ -3543,7 +3527,7 @@ def _start_reply_job(chat_session_id, user_email, prompt, help_stage, ai_kwargs)
 
    def work():
        try:
-           reply = generate_ai_response(**ai_kwargs)
+           reply = producer() if producer else generate_ai_response(**ai_kwargs)
        except Exception as e:  # noqa: BLE001
            print(f"[reply-job] failed: {e}", flush=True)
            refund_rpd(user_email)
@@ -3560,6 +3544,22 @@ def _start_reply_job(chat_session_id, user_email, prompt, help_stage, ai_kwargs)
 
    threading.Thread(target=work, name=f"ss-reply-{job_id}", daemon=True).start()
    return job_id
+
+
+def _open_study_chat(user_email, subject_name, label, kind):
+   """Home 'Practice test' / 'Study notes' buttons: jump to the AI Tutor straight away and let the
+   test or notes be written in the background, so clicking elsewhere cannot cancel them."""
+   what = "practice test" if kind == "test" else "study notes"
+   user_line = f"Study for a test: {label} ({what})"
+   st.session_state["messages"] = [{"role": "user", "content": user_line}]
+   chat_id = start_new_chat_session(user_email, st.session_state["messages"])
+   maker = generate_mock_test_from_memory if kind == "test" else generate_study_notes_from_memory
+   st.session_state["pending_job"] = _start_reply_job(
+       chat_id, user_email, user_line, 3,
+       producer=lambda: maker(user_email, target_subject=subject_name),
+   )
+   st.session_state["page"] = "AI Tutor"
+   st.rerun()
 
 
 def _get_reply_job(job_id):
