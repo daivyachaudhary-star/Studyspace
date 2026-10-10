@@ -105,7 +105,12 @@ def _get_pool():
             _pool = ConnectionPool(
                 DATABASE_URL,
                 min_size=1,
-                max_size=5,
+                max_size=4,
+                # Close connections that sit idle, so old app copies (after a restart or redeploy) do not
+                # keep taking the database's limited number of connection slots for minutes.
+                max_idle=20.0,
+                max_lifetime=900.0,
+                timeout=20.0,
                 kwargs={
                     "autocommit": True,
                     "prepare_threshold": None,
@@ -190,8 +195,18 @@ class _PgCursor:
 class _PgConnection:
     def __init__(self):
         self._pool = _get_pool()
+        self._closed = False
         self._conn = self._pool.getconn()
         self._in_tx = False
+
+    def __del__(self):
+        # Safety net: if some code path failed before close(), hand the connection back when this object
+        # is garbage-collected, instead of leaking one pool slot forever.
+        try:
+            if not self._closed and getattr(self, "_conn", None) is not None:
+                self.close()
+        except Exception:
+            pass
 
     def _replace_conn(self):
         old = self._conn
@@ -222,6 +237,9 @@ class _PgConnection:
     def close(self):
         # Give the connection back to the pool. Anything not committed is rolled back, the same
         # as closing an SQLite connection.
+        if self._closed:
+            return
+        self._closed = True
         try:
             self.rollback()
         finally:
