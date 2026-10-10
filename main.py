@@ -1822,7 +1822,8 @@ def generate_ai_response(
        "events or ideas in order with dates and names, causes, consequences, why it mattered, and connections to "
        "other topics. Use clear headings and short paragraphs, write at least 400 words for a focused sub-topic, "
        "and end with 3 short questions that let the student check their understanding. Never reply with only "
-       "brief notes or a short list unless the student asks for a summary."
+       "brief notes or a short list unless the student asks for a summary. If the request itself specifies an exact "
+       "layout (such as a test paper or a set of revision notes), follow that layout exactly and ignore this paragraph."
    )
    academic_guardrail = academic_guardrail + learn_rule
 
@@ -1973,15 +1974,33 @@ def generate_mock_test_from_memory(user_email, target_subject=None):
    )
 
 
+   subject_title = (target_subject or "Mixed subjects").title()
    prompt = (
        f"Based on the student's study topics and past uploaded assignments:\n{memory_summary}\n\n"
-       f"Generate a targeted 5-question Mock Practice Test with step-by-step solutions and key summary review points "
-       f"specifically formatted to help them study and excel in their test. "
-       f"Wherever an entry above has 'Actual content seen', base your questions on those specific problems "
-       f"(same numbers/expressions/style where reasonable, or close variations of them) rather than inventing "
-       f"generic textbook questions on the topic."
+       f"Write an official-looking school test paper with AT LEAST 10 numbered questions (12 is ideal), "
+       f"aimed at helping the student prepare. Wherever an entry above has 'Actual content seen', base questions on "
+       f"those specific problems (same style, or close variations) instead of generic textbook questions. "
+       f"Use EXACTLY this layout in Markdown, with no text before the first line:\n\n"
+       f"# Practice Test: {subject_title}\n\n"
+       f"| | |\n|---|---|\n| **Name:** ____________________ | **Date:** ____________ |\n"
+       f"| **Time allowed:** (a sensible number) minutes | **Total marks:** (the sum of all marks) |\n\n"
+       f"**Instructions:** (2 or 3 short sentences: answer all questions, show your working, calculators allowed or not)\n\n"
+       f"---\n\n"
+       f"## Section A: Short questions\n(questions 1 to 4, one or two marks each)\n\n"
+       f"## Section B: Problem solving\n(questions 5 to 9, three or four marks each)\n\n"
+       f"## Section C: Extended questions\n(question 10 and above, five or more marks each)\n\n"
+       f"Number the questions continuously (1, 2, 3, ...) and write the marks at the end of each question like **[2 marks]**. "
+       f"Leave a line break between questions. Do NOT put answers inside the question sections. "
+       f"After the last question add a horizontal rule and a final section titled "
+       f"'## Answer key and worked solutions' with the full step-by-step solution to every question, "
+       f"then 'Key points to revise' (3 to 5 short points). Keep a formal, exam-paper tone."
    )
-   return generate_ai_response(prompt, mode="full", user_email=user_email)
+   _res = generate_ai_response(prompt, mode="full", user_email=user_email)
+   # Keep only the paper itself (the model sometimes adds a greeting or wraps it in a code block).
+   _at = _res.find("# Practice Test")
+   if _at > 0:
+       _res = _res[_at:]
+   return _res.replace("```markdown", "").replace("```", "").strip() if _at >= 0 else _res
 
 
 
@@ -3568,6 +3587,47 @@ def _get_reply_job(job_id):
    return _reply_job_store()["jobs"].get(job_id)
 
 
+def _is_test_paper(text):
+   return isinstance(text, str) and text.lstrip().startswith("# Practice Test")
+
+
+def _render_chat_body(msg, idx):
+   """Practice tests are shown like a printed paper (white page, serif text); everything else as normal chat."""
+   if msg.get("role") == "assistant" and _is_test_paper(msg.get("content")):
+       st.markdown(
+           """
+           <style>
+           [class*="st-key-testpaper_"] {
+               background: #ffffff; border: 1px solid #dadce0; border-radius: 4px;
+               padding: 2.2rem 2.6rem; box-shadow: 0 1px 3px rgba(60,64,67,.25);
+               font-family: Georgia, "Times New Roman", serif; color: #202124;
+           }
+           [class*="st-key-testpaper_"] h1 { text-align: center; font-family: Georgia, "Times New Roman", serif; font-size: 1.9rem; border-bottom: 2px solid #202124; padding-bottom: .5rem; }
+           [class*="st-key-testpaper_"] h2 { font-family: Georgia, "Times New Roman", serif; font-size: 1.25rem; margin-top: 1.6rem; border-bottom: 1px solid #dadce0; padding-bottom: .2rem; }
+           [class*="st-key-testpaper_"] table { width: 100%; border: 1px solid #202124; border-collapse: collapse; margin-bottom: 1rem; }
+           [class*="st-key-testpaper_"] td, [class*="st-key-testpaper_"] th { border: 1px solid #202124; padding: .45rem .7rem; }
+           [class*="st-key-testpaper_"] p, [class*="st-key-testpaper_"] li { font-family: Georgia, "Times New Roman", serif; line-height: 1.7; }
+           </style>
+           """,
+           unsafe_allow_html=True,
+       )
+       with st.container(key=f"testpaper_{idx}"):
+           st.markdown(msg["content"])
+   else:
+       st.markdown(msg["content"])
+
+
+@st.fragment(run_every=1)
+def _wait_for_reply(job_id, text):
+   """Shows 'Thinking...' and checks once a second whether the reply is ready. This is a fragment, so the
+   page run itself ends at once (old page elements are cleared) and only this small part keeps refreshing."""
+   job = _get_reply_job(job_id)
+   if job is None or job["status"] != "running" or time.time() - job["started"] > REPLY_TIMEOUT_SECONDS:
+       st.rerun()  # full page run: adds the finished reply to the chat
+       return
+   st.markdown(f"*{text}*")
+
+
 def render_tutor(profile):
    user_name = profile["name"] if profile else "Student"
    user_email = profile["email"] if profile else ""
@@ -3716,23 +3776,18 @@ def render_tutor(profile):
        st.rerun()
 
    # Show the conversation (after any finished reply has been added to it).
-   for msg in st.session_state.messages:
+   for _i, msg in enumerate(st.session_state.messages):
        with st.chat_message(msg["role"]):
            if msg.get("image_bytes"):
                st.image(msg["image_bytes"], caption="Uploaded Screenshot", width=300)
-           st.markdown(msg["content"])
+           _render_chat_body(msg, _i)
 
    # Still writing the answer: wait here. Clicking anything else interrupts only this waiting loop,
    # not the reply itself, which keeps going in the background.
    if waiting_here:
        last_user = next((m for m in reversed(st.session_state.messages) if m.get("role") == "user"), {})
        with st.chat_message("assistant"):
-           with st.spinner("Analyzing screenshot and thinking..." if last_user.get("image_bytes") else "Thinking..."):
-               for _ in range(240):  # up to about 2 minutes per run, then it starts again
-                   if pending_job["status"] != "running":
-                       break
-                   time.sleep(0.5)
-       st.rerun()
+           _wait_for_reply(pending_id, "Analyzing screenshot and thinking..." if last_user.get("image_bytes") else "Thinking...")
 
 
 
