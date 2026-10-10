@@ -56,6 +56,13 @@ _FREE_RPD = _int_secret("FREE_RPD", 25)
 GLOBAL_DAILY_CAP = _int_secret("GLOBAL_DAILY_CAP", 0)
 
 
+# Name the AI gives when someone asks who created StudySpace (change it in secrets with CREATOR_NAME).
+try:
+   CREATOR_NAME = str(st.secrets.get("CREATOR_NAME", "Daivya Chaudhary")).strip() or "Daivya Chaudhary"
+except Exception:
+   CREATOR_NAME = "Daivya Chaudhary"
+
+
 TIER_LIMITS = {
    "freemium": _FREE_RPD,
    "pro": 100,
@@ -1788,6 +1795,13 @@ def generate_ai_response(
        "or complete paper for them, respond: 'It is against my policy to write the entire essay for you. "
        "However, if you provide the essay topic and requirements, I can provide sources, articles, and help you research them.' "
        "Never generate complete essays or finished homework assignments."
+   ) + (
+       f" ABOUT YOU: You are the AI tutor inside StudySpace, a homework-help app created by {CREATOR_NAME}, "
+       f"a student at Tallinn English College (TIK), as a school project. If anyone asks who created, built or "
+       f"made you or StudySpace, answer that {CREATOR_NAME} created it. Do not say that Google, OpenAI or any "
+       f"other company created StudySpace. Only if someone specifically asks which AI model or technology you "
+       f"run on, answer honestly that you run on a Google Gemma language model. Never deny this and never "
+       f"claim that you trained the model yourself."
    )
 
 
@@ -1868,6 +1882,60 @@ def generate_ai_response(
    if "503" in err or "UNAVAILABLE" in err:
        return "Please try again in about 20 seconds. The tutor is briefly unavailable."
    return f"Error communicating with AI: {err}"
+
+
+
+
+def _fetch_study_subjects_uncached(email):
+   """Subjects the student has real study history for (no raw_text, so it is cheap)."""
+   conn = db.connect()
+   cursor = conn.cursor()
+   cursor.execute(
+       """
+       SELECT subject, topic FROM knowledge_items
+       WHERE LOWER(email) = ?
+       ORDER BY timestamp DESC
+       LIMIT 300
+   """,
+       (email.lower().strip(),),
+   )
+   rows = cursor.fetchall()
+   conn.close()
+   subjects = {}
+   for subj, topic in rows:
+       name = (subj or "").strip()
+       if not name:
+           continue
+       key = name.lower()
+       entry = subjects.setdefault(key, {"name": name, "topics": []})
+       t = (topic or "").strip()
+       if t and t not in entry["topics"]:
+           entry["topics"].append(t)
+       entry["count"] = entry.get("count", 0) + 1
+   return list(subjects.values())  # newest subject first
+
+
+def fetch_study_subjects(email):
+   return _run_cached(("study_subjects", email), lambda: _fetch_study_subjects_uncached(email))
+
+
+def generate_study_notes_from_memory(user_email, target_subject=None):
+   stored_items = fetch_stored_topics(user_email, subject=target_subject)
+   if not stored_items:
+       return f"No study history found{' for ' + target_subject if target_subject else ''} yet. Upload a screenshot or ask a question to start building study notes!"
+
+   memory_summary = "\n".join(
+       [f"- Subject: {s}, Topic: {t}, Details: {a}\n  Actual content seen: {r}" for s, t, a, r, ts in stored_items[:10]]
+   )
+
+   prompt = (
+       f"Based on the student's study topics and past uploaded assignments:\n{memory_summary}\n\n"
+       f"Make clear, well-organised STUDY NOTES for revising these topics. Use short headings, key definitions "
+       f"and formulas, one short worked example per topic, and a 'common mistakes' list. Keep it concise, like "
+       f"revision notes a student could read in 10 minutes. Wherever an entry above has 'Actual content seen', "
+       f"use those specific problems for the examples."
+   )
+   return generate_ai_response(prompt, mode="full", user_email=user_email)
 
 
 
@@ -3340,6 +3408,76 @@ def render_home_page(profile):
        )
 
 
+   # ---- STUDY FOR A TEST: subjects the AI has real study history for ----
+   st.markdown("### Study for a test")
+   head_l, head_r = st.columns([4, 1.6], vertical_alignment="center")
+   with head_l:
+       st.caption(
+           "Pick a subject to get a practice test or revision notes. Subjects appear here after you "
+           "ask the tutor questions or upload homework, because the AI builds them from what you have studied."
+       )
+   with head_r:
+       _save_mem = (profile or {}).get("save_topic_memory", True)
+       _new_save_mem = st.toggle(
+           "Save my study topics",
+           value=_save_mem,
+           key="home_save_topic_memory_toggle",
+           help="Turn this off if you do not want StudySpace to remember the topics you study.",
+       )
+       if _new_save_mem != _save_mem:
+           update_save_topic_memory(user_email, _new_save_mem)
+           st.rerun()
+
+   study_subjects = fetch_study_subjects(user_email)[:6]
+   if not study_subjects:
+       with st.container(border=True):
+           st.markdown("**No subjects yet.**")
+           if not _new_save_mem:
+               st.caption("Saving study topics is switched off. Turn it on, then ask the tutor a question.")
+           else:
+               st.caption("Ask the AI Tutor a question or upload a photo of your homework. "
+                          "The subject will show up here, ready for a practice test or notes.")
+           if st.button("Go to AI Tutor", key="btn_study_go_tutor"):
+               st.session_state["page"] = "AI Tutor"
+               st.rerun()
+   else:
+       for row_start in range(0, len(study_subjects), 3):
+           card_cols = st.columns(3)
+           for col, subj in zip(card_cols, study_subjects[row_start:row_start + 3]):
+               with col:
+                   with st.container(border=True):
+                       _label = subj["name"] if not subj["name"].islower() else subj["name"].title()
+                       st.markdown(f"**{_label}**")
+                       _n = subj.get("count", 0)
+                       st.caption(f"{_n} saved topic{'s' if _n != 1 else ''}")
+                       if subj["topics"]:
+                           st.caption(", ".join(t[:28] for t in subj["topics"][:2]))
+                       _k = "".join(ch if ch.isalnum() else "_" for ch in subj["name"].lower())[:40]
+                       b1, b2 = st.columns(2)
+                       with b1:
+                           if st.button("Practice test", key=f"study_test_{row_start}_{_k}", use_container_width=True):
+                               with st.spinner(f"Making your {_label} practice test..."):
+                                   _res = generate_mock_test_from_memory(user_email, target_subject=subj["name"])
+                               st.session_state["messages"] = [
+                                   {"role": "user", "content": f"Study for a test: {_label} (practice test)"},
+                                   {"role": "assistant", "content": _res, "help_stage": 3},
+                               ]
+                               start_new_chat_session(user_email, st.session_state["messages"])
+                               st.session_state["page"] = "AI Tutor"
+                               st.rerun()
+                       with b2:
+                           if st.button("Study notes", key=f"study_notes_{row_start}_{_k}", use_container_width=True):
+                               with st.spinner(f"Making your {_label} study notes..."):
+                                   _res = generate_study_notes_from_memory(user_email, target_subject=subj["name"])
+                               st.session_state["messages"] = [
+                                   {"role": "user", "content": f"Study for a test: {_label} (study notes)"},
+                                   {"role": "assistant", "content": _res, "help_stage": 3},
+                               ]
+                               start_new_chat_session(user_email, st.session_state["messages"])
+                               st.session_state["page"] = "AI Tutor"
+                               st.rerun()
+   st.caption("Each practice test or set of notes uses 1 of your daily requests.")
+
    sw1, sw2, sw3 = st.columns(3)
    with sw2:
        if st.button("+ Join Class", use_container_width=True, key="btn_join_class_widget"):
@@ -3915,74 +4053,6 @@ def main():
                            st.rerun()
                else:
                    st.caption("No matching chats found.")
-
-
-       # SIDEBAR "STUDY FOR A TEST" BUTTON & MEMORY SAVE TOGGLE
-       col_test_btn, col_test_toggle = st.columns([3, 1], vertical_alignment="center")
-       with col_test_btn:
-           if st.button("Study for a test", use_container_width=True, key="btn_study_for_test"):
-               st.session_state["show_test_prep"] = not st.session_state.get("show_test_prep", False)
-               st.rerun()
-
-
-       with col_test_toggle:
-           current_save_mem = active_profile.get("save_topic_memory", True)
-           save_mem_toggle = st.toggle(
-               "",
-               value=current_save_mem,
-               key="save_topic_memory_toggle",
-               help="Toggle on/off automatically saving key study topics for test prep.",
-           )
-           if save_mem_toggle != current_save_mem:
-               update_save_topic_memory(user_email, save_mem_toggle)
-               st.rerun()
-
-
-       # SEARCH OVERLAY WHEN "STUDY FOR A TEST" IS CLICKED
-       if st.session_state.get("show_test_prep"):
-           st.markdown("##### Test Prep & Revision")
-           subject_query = st.text_input(
-               "Search Subject:",
-               key="test_prep_subject_input",
-               placeholder="e.g. Physics, Math, Biology",
-           )
-
-
-           if subject_query:
-               matching_items = fetch_stored_topics(user_email, subject=subject_query)
-               if matching_items:
-                   st.caption(f"Found {len(matching_items)} topic entry(ies) for '{subject_query}':")
-                   for s, t, a, r, ts in matching_items[:3]:
-                       st.markdown(f"- **{t}**: *{a}*")
-
-
-                   if st.button(f"Generate Practice Test for {subject_query}", key="btn_gen_subj_test",
-                                use_container_width=True):
-                       with st.spinner(f"Generating practice test for {subject_query}..."):
-                           mock_res = generate_mock_test_from_memory(user_email, target_subject=subject_query)
-                           st.session_state["messages"] = [
-                               {"role": "user", "content": f"Study for a test: {subject_query}"},
-                               {"role": "assistant", "content": mock_res, "help_stage": 3}
-                           ]
-                           start_new_chat_session(user_email, st.session_state["messages"])
-                           st.session_state["page"] = "AI Tutor"
-                           st.session_state["show_test_prep"] = False
-                           st.rerun()
-               else:
-                   st.caption(f"No previous topics saved for '{subject_query}' yet.")
-
-
-           with st.expander("Learn more", expanded=False):
-               st.markdown(
-                   """
-                   <div class="learn-more-box">
-                       <b>How Test Prep Works:</b><br/>
-                       When you ask questions or drop homework screenshots, the AI keeps a quick note of the main subject topics (like <i>Calculus</i> or <i>Cell Structure</i>).<br/><br/>
-                       This lets you generate custom practice tests and study guides whenever an exam is coming up! You can toggle this on or off anytime using the switch next to <b>Study for a test</b>.
-                   </div>
-                   """,
-                   unsafe_allow_html=True,
-               )
 
 
        # SIDEBAR "CLASSES" WIDGET (TEACHERS: + REQUESTS. STUDENTS: THEIR OWN CLASSES.)
