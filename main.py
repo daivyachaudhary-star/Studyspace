@@ -1557,6 +1557,11 @@ def _is_rate_limited(msg):
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg
 
 
+def _is_transient(msg):
+    # Google-side hiccups worth retrying: 503 UNAVAILABLE and 500 INTERNAL
+    return "503" in msg or "UNAVAILABLE" in msg or "500" in msg or "INTERNAL" in msg
+
+
 def _is_model_missing(msg):
     return "404" in msg or "NOT_FOUND" in msg
 
@@ -1600,7 +1605,7 @@ def _generate_with_fallback(client, contents, config=None):
             except Exception as e:  # noqa: BLE001
                 last_err = str(e)
                 print(f"[gemini] model={model} attempt={attempt} error={last_err[:400]}", flush=True)
-                if ("503" in last_err or "UNAVAILABLE" in last_err) and attempt < 2:
+                if _is_transient(last_err) and attempt < 2:
                     time.sleep(2 * (attempt + 1))
                     continue
                 break  # 429 / 404 / other: go to the next model
@@ -1810,6 +1815,17 @@ def generate_ai_response(
    )
 
 
+   learn_rule = (
+       " LEARNING A TOPIC: If the student wants to learn or understand a topic (for example history, geography, "
+       "biology, literature, or 'explain X') and is NOT asking you to solve a specific homework question, then the "
+       "limits above on method, hints and answers DO NOT apply. Teach the topic IN DEPTH: give background, the key "
+       "events or ideas in order with dates and names, causes, consequences, why it mattered, and connections to "
+       "other topics. Use clear headings and short paragraphs, write at least 400 words for a focused sub-topic, "
+       "and end with 3 short questions that let the student check their understanding. Never reply with only "
+       "brief notes or a short list unless the student asks for a summary."
+   )
+   academic_guardrail = academic_guardrail + learn_rule
+
    if mode == "method":
        system_instruction = (
                f"You are an interactive AI tutor.{grade_context} Provide ONLY the core method, concepts, "
@@ -1884,9 +1900,10 @@ def generate_ai_response(
        refund_rpd(user_email)   # Gemini failed, so don't charge the student a request
    if _is_rate_limited(err):
        return _friendly_wait(err)
-   if "503" in err or "UNAVAILABLE" in err:
-       return "Please try again in about 20 seconds. The tutor is briefly unavailable."
-   return f"Error communicating with AI: {err}"
+   if _is_transient(err):
+       return "The tutor hit a temporary problem on Google's side. Please send your message again in a few seconds."
+   print(f"[gemini] unhandled error shown to student as generic: {err[:300]}", flush=True)
+   return "Something went wrong while the tutor was answering. Please try again in a moment."
 
 
 
