@@ -1692,7 +1692,7 @@ def extract_and_store_topic_details(prompt, image_bytes, mime_type, user_email):
                raw_text=data.get("content_summary") or prompt,
            )
            try:
-               prebuild_test_async(user_email, data.get("subject", "General"))
+               prebuild_all_async(user_email, data.get("subject", "General"))
            except Exception as _e:  # noqa: BLE001
                print(f"[prebuild] could not start: {_e}", flush=True)
            break
@@ -2011,26 +2011,24 @@ def generate_mock_test_from_memory(user_email, target_subject=None, charge=True)
        f"Leave a line break between questions. "
        f"IMPORTANT: this is a TEST PAPER, so do NOT include any answers, answer key, worked solutions, hints, "
        f"final results or example answers anywhere, not even at the end. Only the questions. "
-       f"Finish with a horizontal rule and this exact line in italics: "
-       f"*When you have finished, send me your answers one question at a time and I will guide you through them.* "
+       f"End the paper right after the last question: no closing line, no sign-off, no extra notes. "
        f"Keep a formal, exam-paper tone."
    )
    _res = generate_ai_response(prompt, mode="full", user_email=user_email if charge else "")
    # Keep only the paper itself (the model sometimes adds a greeting or wraps it in a code block).
+   if len(_res) < 300:
+       return _res  # an error or limit message, not a paper
+   _res = _res.replace("```markdown", "").replace("```", "").strip()
    _at = _res.find("# Practice Test")
    if _at > 0:
        _res = _res[_at:]
-   if _at < 0:
-       return _res
-   _res = _res.replace("```markdown", "").replace("```", "").strip()
+   elif _at < 0:
+       _res = f"# Practice Test: {subject_title}\n\n" + _res
    # Safety net: a test paper never carries answers. Cut anything from an answer / solution heading onwards.
    _cut = re.search(r"^\s*#{1,4}\s*(answer key|answers|worked solutions|solutions|mark scheme|model answers)",
                     _res, flags=re.IGNORECASE | re.MULTILINE)
    if _cut:
        _res = _res[:_cut.start()].rstrip().rstrip("-").rstrip()
-   _footer = "*When you have finished, send me your answers one question at a time and I will guide you through them.*"
-   if "send me your answers" not in _res:
-       _res = _res + "\n\n---\n\n" + _footer
    return _res
 
 
@@ -2047,10 +2045,17 @@ def _study_key(name):
 
 def _study_looks_ok(kind, text):
    if not isinstance(text, str) or len(text) < 300:
+       print(f"[prebuild] rejected {kind}: too short or empty ({len(text) if isinstance(text, str) else 'n/a'} chars): {str(text)[:150]!r}", flush=True)
        return False
    if text.startswith(("Your ", "StudySpace has used", "The tutor", "Something went wrong", "No study history", "Server Proxy")):
+       print(f"[prebuild] rejected {kind}: error message instead of content: {text[:150]!r}", flush=True)
        return False
-   return _is_test_paper(text) if kind == "test" else True
+   if kind == "test":
+       numbered = len(re.findall(r"^\s*\**\d{1,2}[.)]", text, flags=re.MULTILINE))
+       if numbered < 8:
+           print(f"[prebuild] rejected test: only {numbered} numbered questions found", flush=True)
+           return False
+   return True
 
 
 def _ensure_prebuilt_table():
@@ -2147,12 +2152,19 @@ def _study_count(email, subject_name):
    return n
 
 
-def prebuild_test_async(email, subject_name, fingerprint=None):
-   """Build the practice test for a subject in the background (free for the student, counted in the shared cap)."""
+def _is_building(email, subject_name, kind):
+   store = _reply_job_store()
+   with store["lock"]:
+       return (email.lower().strip(), _study_key(subject_name), kind) in store.get("building", set())
+
+
+def prebuild_study_async(email, subject_name, kind, fingerprint=None):
+   """Build a practice test ('test') or revision notes ('notes') in the background. Free for the student,
+   counted in the shared daily cap. At most 2 are written at the same time, to stay inside the model's limits."""
    if not email or not subject_name or _study_key(subject_name) in ("", "general"):
        return
    store = _reply_job_store()
-   key = (email.lower().strip(), _study_key(subject_name), "test")
+   key = (email.lower().strip(), _study_key(subject_name), kind)
    with store["lock"]:
        building = store.setdefault("building", set())
        if key in building:
@@ -2167,22 +2179,31 @@ def prebuild_test_async(email, subject_name, fingerprint=None):
    def work():
        try:
            fp = fingerprint if fingerprint is not None else _study_count(email, subject_name)
-           if get_prebuilt_content(email, subject_name, "test", fp) is not None:
+           if get_prebuilt_content(email, subject_name, kind, fp) is not None:
                return  # already fresh
            if GLOBAL_DAILY_CAP and _global_used_today() >= GLOBAL_DAILY_CAP:
+               print("[prebuild] skipped: shared daily cap reached", flush=True)
                return
-           text = generate_mock_test_from_memory(email, target_subject=subject_name, charge=False)
-           if _study_looks_ok("test", text):
-               save_prebuilt(email, subject_name, "test", fp, text)
+           with store["sem"]:
+               _t0 = time.time()
+               maker = generate_mock_test_from_memory if kind == "test" else generate_study_notes_from_memory
+               text = maker(email, target_subject=subject_name, charge=False)
+           if _study_looks_ok(kind, text):
+               save_prebuilt(email, subject_name, kind, fp, text)
                _global_add()
-               print(f"[prebuild] test ready subject={subject_name}", flush=True)
+               print(f"[prebuild] {kind} ready subject={subject_name} seconds={time.time() - _t0:.0f}", flush=True)
        except Exception as e:  # noqa: BLE001
-           print(f"[prebuild] failed: {e}", flush=True)
+           print(f"[prebuild] {kind} failed: {e}", flush=True)
        finally:
            with store["lock"]:
                store["building"].discard(key)
 
-   threading.Thread(target=work, name="ss-reply-prebuild", daemon=True).start()
+   threading.Thread(target=work, name=f"ss-reply-prebuild-{kind}", daemon=True).start()
+
+
+def prebuild_all_async(email, subject_name, fingerprint=None):
+   for _kind in ("test", "notes"):
+       prebuild_study_async(email, subject_name, _kind, fingerprint)
 
 
 
@@ -3666,9 +3687,10 @@ def render_home_page(profile):
    else:
        try:
            _home_prebuilt = get_prebuilt_status(user_email)
-           for _subj in study_subjects[:3]:  # get the newest subjects' tests ready in the background
-               if _home_prebuilt.get((_study_key(_subj["name"]), "test")) != str(_subj.get("count", 0)):
-                   prebuild_test_async(user_email, _subj["name"], _subj.get("count", 0))
+           for _subj in study_subjects[:3]:  # get the newest subjects' tests and notes ready in the background
+               for _kind in ("test", "notes"):
+                   if _home_prebuilt.get((_study_key(_subj["name"]), _kind)) != str(_subj.get("count", 0)):
+                       prebuild_study_async(user_email, _subj["name"], _kind, _subj.get("count", 0))
        except Exception as _e:  # noqa: BLE001
            _home_prebuilt = {}
            print(f"[prebuild] home check failed: {_e}", flush=True)
@@ -3682,7 +3704,9 @@ def render_home_page(profile):
                        _n = subj.get("count", 0)
                        _ready_map = _home_prebuilt
                        _test_ready = _ready_map.get((_study_key(subj["name"]), "test")) == str(_n)
-                       st.caption(f"{_n} saved topic{'s' if _n != 1 else ''}" + ("  |  Test ready" if _test_ready else ""))
+                       _notes_ready = _ready_map.get((_study_key(subj["name"]), "notes")) == str(_n)
+                       _ready_txt = " and ".join(x for x, ok in (("Test", _test_ready), ("Notes", _notes_ready)) if ok)
+                       st.caption(f"{_n} saved topic{'s' if _n != 1 else ''}" + (f"  |  {_ready_txt} ready" if _ready_txt else "  |  Getting ready..."))
                        if subj["topics"]:
                            st.caption(", ".join(t[:28] for t in subj["topics"][:2]))
                        _k = "".join(ch if ch.isalnum() else "_" for ch in subj["name"].lower())[:40]
@@ -3693,7 +3717,7 @@ def render_home_page(profile):
                        with b2:
                            if st.button("Study notes", key=f"study_notes_{row_start}_{_k}", use_container_width=True):
                                _open_study_chat(user_email, subj["name"], _label, "notes", subj.get("count", 0))
-   st.caption("Practice tests are prepared in advance and open instantly. Study notes, and tests that are not ready yet, use 1 of your daily requests.")
+   st.caption("Practice tests and notes are prepared in advance and open instantly once they say ready. One that is not ready yet uses 1 of your daily requests.")
 
    sw1, sw2, sw3 = st.columns(3)
    with sw2:
@@ -3716,7 +3740,7 @@ REPLY_TIMEOUT_SECONDS = 180
 
 @st.cache_resource
 def _reply_job_store():
-   return {"lock": threading.Lock(), "jobs": {}}
+   return {"lock": threading.Lock(), "jobs": {}, "sem": threading.Semaphore(2)}
 
 
 def _start_reply_job(chat_session_id, user_email, prompt, help_stage, ai_kwargs=None, producer=None):
@@ -3779,6 +3803,19 @@ def _open_study_chat(user_email, subject_name, label, kind, count=None):
    maker = generate_mock_test_from_memory if kind == "test" else generate_study_notes_from_memory
 
    def produce():
+       # If this very test/notes is already being written in the background, wait for it instead of
+       # starting a second slow request for the same thing.
+       if _is_building(user_email, subject_name, kind):
+           for _ in range(90):
+               time.sleep(2)
+               got = get_prebuilt_content(user_email, subject_name, kind, count)
+               if got:
+                   return got
+               if not _is_building(user_email, subject_name, kind):
+                   break
+           got = get_prebuilt_content(user_email, subject_name, kind, count)
+           if got:
+               return got
        text = maker(user_email, target_subject=subject_name)
        if _study_looks_ok(kind, text):
            try:
