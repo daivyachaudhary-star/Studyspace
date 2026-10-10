@@ -3860,7 +3860,10 @@ def _render_chat_body(msg, idx):
            unsafe_allow_html=True,
        )
        with st.container(key=f"testpaper_{idx}"):
-           st.markdown(msg["content"])
+           # Older saved tests ended with a "send me your answers..." line. Never show it.
+           _body = re.sub(r"(?im)^.*send me your answers one question at a time.*$", "", msg["content"])
+           _body = re.sub(r"(\n\s*-{3,}\s*)+\s*$", "", _body).rstrip()
+           st.markdown(_body)
    else:
        st.markdown(msg["content"])
 
