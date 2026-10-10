@@ -1,6 +1,7 @@
 import os
 import re
 import db  # database layer: hosted Postgres (Supabase) or local SQLite file
+import planner  # study-gap planner: fits study blocks around sleep, school and sport
 import datetime
 import json
 import base64
@@ -2131,6 +2132,9 @@ def save_prebuilt(email, subject_name, kind, fingerprint, content):
    conn = db.connect()
    try:
        cursor = conn.cursor()
+       cursor.execute("SELECT 1 FROM user_profile WHERE LOWER(email) = ?", (email.lower().strip(),))
+       if not cursor.fetchone():
+           return  # the account was deleted while this was being built: store nothing
        cursor.execute("DELETE FROM prebuilt_study WHERE LOWER(email) = ? AND subject_key = ? AND kind = ?",
                       (email.lower().strip(), _study_key(subject_name), kind))
        cursor.execute(
@@ -2208,6 +2212,392 @@ def prebuild_all_async(email, subject_name, fingerprint=None):
 
 
 
+# AUTOMATIC CHAT DELETION (data minimisation, GDPR Article 5).
+# Chats that have not been used for CHAT_RETENTION_DAYS are deleted together with their
+# messages and uploaded photos. The privacy notice says the same number, so change both
+# by changing this one constant.
+CHAT_RETENTION_DAYS = 365
+
+
+def purge_old_chats(days=None):
+   """Deletes chat sessions (and their messages) not updated for `days` days.
+   Never raises: a cleanup problem must not stop the app. Returns how many chats it deleted."""
+   try:
+       days = int(days or CHAT_RETENTION_DAYS)
+       cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+       conn = db.connect()
+       try:
+           cursor = conn.cursor()
+           cursor.execute("SELECT COUNT(*) FROM chat_sessions WHERE updated_at IS NOT NULL AND updated_at < ?", (cutoff,))
+           _row = cursor.fetchone()
+           _n = int(_row[0]) if _row else 0
+           if _n:
+               cursor.execute(
+                   "DELETE FROM chat_messages WHERE session_id IN "
+                   "(SELECT id FROM chat_sessions WHERE updated_at IS NOT NULL AND updated_at < ?)", (cutoff,))
+               cursor.execute("DELETE FROM chat_sessions WHERE updated_at IS NOT NULL AND updated_at < ?", (cutoff,))
+               conn.commit()
+               print(f"[retention] deleted {_n} chat(s) older than {days} days")
+           return _n
+       finally:
+           conn.close()
+   except Exception as _e:
+       print("[retention] cleanup failed:", repr(_e)[:200])
+       return 0
+
+
+@st.cache_resource
+def _retention_state():
+   return {"last": 0.0, "lock": threading.Lock()}
+
+
+def run_retention_cleanup_if_due():
+   """Runs the cleanup at most once a day, in the background, so no student waits for it."""
+   _s = _retention_state()
+   _now = time.time()
+   with _s["lock"]:
+       if _now - _s["last"] < 86400:
+           return
+       _s["last"] = _now
+   threading.Thread(target=purge_old_chats, name="ss-retention", daemon=True).start()
+
+
+# STUDY PLANNER (study-gap algorithm lives in planner.py; this part saves the data and shows it)
+PLANNER_REMINDER_PREFIX = "Study block: "
+
+
+def _ensure_planner_tables():
+   """Creates the planner tables on first use (a hosted database is not re-initialised on every deploy)."""
+   store = _reply_job_store()
+   if store.get("planner_tables_ok"):
+       return
+   conn = db.connect()
+   try:
+       cursor = conn.cursor()
+       cursor.execute("""
+           CREATE TABLE IF NOT EXISTS weekly_commitments (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               email TEXT,
+               kind TEXT,
+               day INTEGER,
+               start_min INTEGER,
+               end_min INTEGER
+           )
+       """)
+       cursor.execute("""
+           CREATE TABLE IF NOT EXISTS study_plan_blocks (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               email TEXT,
+               block_date TEXT,
+               start_min INTEGER,
+               end_min INTEGER,
+               title TEXT,
+               source TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+           )
+       """)
+       conn.commit()
+   finally:
+       conn.close()
+   store["planner_tables_ok"] = True
+
+
+def load_commitments(email):
+   """(commitments, saved). `saved` is False when the student has not saved their own times yet."""
+   _ensure_planner_tables()
+   conn = db.connect()
+   try:
+       cursor = conn.cursor()
+       cursor.execute("SELECT kind, day, start_min, end_min FROM weekly_commitments WHERE LOWER(email) = ?",
+                      (email.lower().strip(),))
+       rows = cursor.fetchall()
+   finally:
+       conn.close()
+   if not rows:
+       return {k: (list(v) if isinstance(v, list) else v) for k, v in planner.DEFAULT_COMMITMENTS.items()}, False
+   c = {"sleep": planner.DEFAULT_COMMITMENTS["sleep"], "school": [], "sport": [], "other": []}
+   for kind, day, s, e in rows:
+       if kind == "sleep":
+           c["sleep"] = (int(s), int(e))
+       elif kind in c:
+           c[kind].append((int(day), int(s), int(e)))
+   return c, True
+
+
+def save_commitments(email, c):
+   _ensure_planner_tables()
+   e = email.lower().strip()
+   conn = db.connect()
+   try:
+       cursor = conn.cursor()
+       cursor.execute("DELETE FROM weekly_commitments WHERE LOWER(email) = ?", (e,))
+       cursor.execute("INSERT INTO weekly_commitments (email, kind, day, start_min, end_min) VALUES (?, 'sleep', -1, ?, ?)",
+                      (e, int(c["sleep"][0]), int(c["sleep"][1])))
+       for kind in ("school", "sport", "other"):
+           for d, s, en in c.get(kind, []):
+               cursor.execute("INSERT INTO weekly_commitments (email, kind, day, start_min, end_min) VALUES (?, ?, ?, ?, ?)",
+                              (e, kind, int(d), int(s), int(en)))
+       conn.commit()
+   finally:
+       conn.close()
+
+
+def _planner_today():
+   return datetime.datetime.now(APP_TIMEZONE).date()
+
+
+def load_plan_blocks(email, from_date=None):
+   _ensure_planner_tables()
+   from_date = from_date or _planner_today()
+   conn = db.connect()
+   try:
+       cursor = conn.cursor()
+       cursor.execute(
+           "SELECT id, block_date, start_min, end_min, title, source FROM study_plan_blocks "
+           "WHERE LOWER(email) = ? AND block_date >= ? ORDER BY block_date, start_min",
+           (email.lower().strip(), from_date.isoformat()))
+       rows = cursor.fetchall()
+   finally:
+       conn.close()
+   out = []
+   for r_id, d, s, en, title, source in rows:
+       try:
+           out.append({"id": r_id, "date": datetime.date.fromisoformat(str(d)[:10]), "start": int(s),
+                       "end": int(en), "title": title, "source": source})
+       except ValueError:
+           continue
+   return out
+
+
+def replace_auto_blocks(email, blocks):
+   """Swaps the automatic blocks from today onwards for a new set. The student's own blocks are kept."""
+   _ensure_planner_tables()
+   e = email.lower().strip()
+   conn = db.connect()
+   try:
+       cursor = conn.cursor()
+       cursor.execute("DELETE FROM study_plan_blocks WHERE LOWER(email) = ? AND source = 'auto' AND block_date >= ?",
+                      (e, _planner_today().isoformat()))
+       for b in blocks:
+           cursor.execute(
+               "INSERT INTO study_plan_blocks (email, block_date, start_min, end_min, title, source) VALUES (?, ?, ?, ?, ?, 'auto')",
+               (e, b["date"].isoformat(), int(b["start"]), int(b["end"]), b["title"]))
+       conn.commit()
+   finally:
+       conn.close()
+
+
+def add_manual_block(email, day, start, end, title):
+   _ensure_planner_tables()
+   conn = db.connect()
+   try:
+       cursor = conn.cursor()
+       cursor.execute(
+           "INSERT INTO study_plan_blocks (email, block_date, start_min, end_min, title, source) VALUES (?, ?, ?, ?, ?, 'manual')",
+           (email.lower().strip(), day.isoformat(), int(start), int(end), title.strip()))
+       conn.commit()
+   finally:
+       conn.close()
+
+
+def delete_plan_block(email, block_id):
+   _ensure_planner_tables()
+   conn = db.connect()
+   try:
+       cursor = conn.cursor()
+       cursor.execute("DELETE FROM study_plan_blocks WHERE id = ? AND LOWER(email) = ?",
+                      (int(block_id), email.lower().strip()))
+       conn.commit()
+   finally:
+       conn.close()
+
+
+def sync_plan_reminders(email):
+   """One in-app reminder per future study block, due at the block's start time. The home page banner
+   shows a reminder from 10 minutes before it is due, so the student is alerted about 10 minutes ahead."""
+   e = email.lower().strip()
+   conn = db.connect()
+   try:
+       cursor = conn.cursor()
+       cursor.execute("DELETE FROM reminders WHERE LOWER(user_email) = ? AND title LIKE ?",
+                      (e, PLANNER_REMINDER_PREFIX + "%"))
+       conn.commit()
+   finally:
+       conn.close()
+   now = datetime.datetime.now(APP_TIMEZONE).replace(tzinfo=None)
+   made = 0
+   for b in load_plan_blocks(e):
+       start_dt = datetime.datetime.combine(b["date"], datetime.time(b["start"] // 60, b["start"] % 60))
+       if start_dt > now:
+           create_reminder(e, PLANNER_REMINDER_PREFIX + b["title"], start_dt.isoformat())
+           made += 1
+   return made
+
+
+def _planner_tasks(email):
+   """Upcoming tests and homework for this student, as the planner expects them."""
+   tasks = []
+   try:
+       for _id, t_title, subject, topic, t_date in get_upcoming_tests_for_display(email):
+           try:
+               tasks.append({"title": f"{subject or 'Test'}: {t_title}", "due": datetime.date.fromisoformat(str(t_date)[:10]), "kind": "test"})
+           except ValueError:
+               pass
+       for _id, h_title, topic, due, class_name in get_student_upcoming_homework(email):
+           try:
+               tasks.append({"title": f"{class_name}: {h_title}", "due": datetime.date.fromisoformat(str(due)[:10]), "kind": "homework"})
+           except ValueError:
+               pass
+   except Exception as e:  # noqa: BLE001
+       print("[planner] could not read tests/homework:", repr(e)[:150])
+   return tasks
+
+
+def build_and_save_plan(email):
+   """Builds the study plan around the student's own blocks, saves it and sets the alerts.
+   Returns (blocks_made, unscheduled_list, alerts_made)."""
+   c, _saved = load_commitments(email)
+   now = datetime.datetime.now(APP_TIMEZONE)
+   manual = [b for b in load_plan_blocks(email) if b["source"] == "manual"]
+   plan, unscheduled = planner.build_plan(c, _planner_tasks(email), now.date(),
+                                          now_min=now.hour * 60 + now.minute, manual_blocks=manual)
+   replace_auto_blocks(email, plan)
+   alerts = sync_plan_reminders(email)
+   return len(plan), unscheduled, alerts
+
+
+def _planner_add_block_cb(email):
+   ss = st.session_state
+   day, s, e = ss.get("pl_new_date"), ss.get("pl_new_start"), ss.get("pl_new_end")
+   title = (ss.get("pl_new_title") or "").strip() or "Study"
+   if not (day and s and e):
+       ss["pl_msg"] = ("warning", "Pick a date, a start time and an end time.")
+       return
+   sm, em = planner.to_min(s), planner.to_min(e)
+   if em <= sm:
+       ss["pl_msg"] = ("warning", "The end time has to be after the start time.")
+       return
+   c, _saved = load_commitments(email)
+   hit = planner.block_conflicts(day, sm, em, c)
+   add_manual_block(email, day, sm, em, title)
+   sync_plan_reminders(email)
+   if hit:
+       ss["pl_msg"] = ("warning", "Added, but it overlaps your " + ", ".join(hit) + " time.")
+   else:
+       ss["pl_msg"] = ("success", "Added. You will get an alert about 10 minutes before it starts.")
+
+
+def _planner_delete_block_cb(email, block_id):
+   delete_plan_block(email, block_id)
+   sync_plan_reminders(email)
+
+
+def _planner_build_cb(email):
+   n, unscheduled, alerts = build_and_save_plan(email)
+   if n == 0 and not unscheduled:
+       st.session_state["pl_msg"] = ("info", "No upcoming tests or homework found, so there is nothing to plan. You can still add your own blocks below.")
+   elif unscheduled:
+       names = ", ".join(u["title"] for u in unscheduled)
+       st.session_state["pl_msg"] = ("warning", f"Built {n} study blocks, but there was not enough free time for: {names}.")
+   else:
+       st.session_state["pl_msg"] = ("success", f"Built {n} study blocks. Alerts are set for about 10 minutes before each one.")
+
+
+@st.dialog("Study Planner", width="large")
+def render_study_planner(profile):
+   email = profile["email"]
+   c, saved = load_commitments(email)
+   tab_plan, tab_times = st.tabs(["My study plan", "My weekly times"])
+   day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+   with tab_times:
+       st.caption("Tell StudySpace when you are busy. Study blocks are only placed in the free time left over, "
+                  "never in your sleep, school or sport time.")
+       if not saved:
+           st.info("These are starting values. Change them to match your week and press Save.")
+       bed_default = datetime.time(c["sleep"][0] // 60, c["sleep"][0] % 60)
+       wake_default = datetime.time(c["sleep"][1] // 60, c["sleep"][1] % 60)
+       sc1, sc2 = st.columns(2)
+       with sc1:
+           bed = st.time_input("Bedtime", bed_default, key="pl_bed")
+       with sc2:
+           wake = st.time_input("Wake-up time", wake_default, key="pl_wake")
+       st.markdown("**School, sport and other fixed times** (add one row for each)")
+       rows = []
+       for kind in ("school", "sport", "other"):
+           for d, s, en in c.get(kind, []):
+               rows.append({"Type": kind, "Day": day_names[d], "Start": datetime.time(s // 60, s % 60),
+                            "End": datetime.time(en // 60, en % 60)})
+       edited = st.data_editor(
+           rows or [{"Type": "sport", "Day": "Monday", "Start": datetime.time(17, 0), "End": datetime.time(18, 30)}][:0],
+           num_rows="dynamic", use_container_width=True, key="pl_rows_editor",
+           column_config={
+               "Type": st.column_config.SelectboxColumn("Type", options=["school", "sport", "other"], required=True),
+               "Day": st.column_config.SelectboxColumn("Day", options=day_names, required=True),
+               "Start": st.column_config.TimeColumn("Start", format="HH:mm", required=True),
+               "End": st.column_config.TimeColumn("End", format="HH:mm", required=True),
+           },
+       )
+       if st.button("Save my weekly times", key="pl_save_times", type="primary"):
+           new_c = {"sleep": (planner.to_min(bed), planner.to_min(wake)), "school": [], "sport": [], "other": []}
+           problems = []
+           for row in (edited.to_dict("records") if hasattr(edited, "to_dict") else edited):
+               try:
+                   kind, day, s, en = row["Type"], row["Day"], row["Start"], row["End"]
+                   if kind not in new_c or day not in day_names or s is None or en is None:
+                       raise ValueError
+                   sm, em = planner.to_min(s), planner.to_min(en)
+                   if em <= sm:
+                       problems.append(f"{day} {kind}: the end must be after the start.")
+                       continue
+                   new_c[kind].append((day_names.index(day), sm, em))
+               except (KeyError, ValueError, AttributeError, TypeError):
+                   problems.append("A row is incomplete. Fill in every column or delete the row.")
+           if new_c["sleep"][0] == new_c["sleep"][1]:
+               problems.append("Bedtime and wake-up time cannot be the same.")
+           if problems:
+               for p in dict.fromkeys(problems):
+                   st.warning(p)
+           else:
+               save_commitments(email, new_c)
+               st.success("Saved. Press 'Build my study plan' on the other tab to use these times.")
+
+   with tab_plan:
+       st.caption("StudySpace fits study time for your upcoming tests and homework into the gaps in your week. "
+                  "You can also add your own blocks. You get an alert in the app about 10 minutes before each block starts "
+                  "(alerts show while StudySpace is open).")
+       if not saved:
+           st.info("Tip: open 'My weekly times' first and save your real sleep, school and sport times.")
+       st.button("Build my study plan", key="pl_build_btn", type="primary", on_click=_planner_build_cb, args=(email,))
+       msg = st.session_state.pop("pl_msg", None)
+       if msg:
+           getattr(st, msg[0])(msg[1])
+       blocks = load_plan_blocks(email)
+       if blocks:
+           res = planner.count_conflicts([{"date": b["date"], "start": b["start"], "end": b["end"]} for b in blocks], c)
+           st.caption(f"Checked {res['total']} study blocks against your sleep, school and sport times: "
+                      f"{res['any']} clashes.")
+           last_day = None
+           for b in blocks:
+               if b["date"] != last_day:
+                   st.markdown(f"**{b['date'].strftime('%A %d %B')}**")
+                   last_day = b["date"]
+               r1, r2 = st.columns([6, 1])
+               tag = "your block" if b["source"] == "manual" else "auto"
+               r1.write(f"{planner.fmt(b['start'])} - {planner.fmt(b['end'])}  {b['title']}  ({tag})")
+               r2.button("Delete", key=f"pl_del_{b['id']}", on_click=_planner_delete_block_cb, args=(email, b["id"]))
+       else:
+           st.write("No study blocks yet.")
+       with st.expander("Add my own study block"):
+           with st.form("pl_add_form", clear_on_submit=False):
+               st.date_input("Date", _planner_today(), key="pl_new_date")
+               a1, a2 = st.columns(2)
+               a1.time_input("Start", datetime.time(17, 0), key="pl_new_start")
+               a2.time_input("End", datetime.time(18, 0), key="pl_new_end")
+               st.text_input("What are you studying?", key="pl_new_title")
+               st.form_submit_button("Add block", on_click=_planner_add_block_cb, args=(email,))
+
+
 # INITIALIZE APPLICATION COMPONENTS
 @st.cache_resource
 def _init_db_once():
@@ -2218,6 +2608,7 @@ def _init_db_once():
 
 
 _init_db_once()
+run_retention_cleanup_if_due()
 # Superseded by the in-app due-soon banner (get_due_soon_reminders, used in
 # render_home_page): that's a live query on page load, so this background
 # push-based thread no longer needs to run. Left defined, not deleted, in
@@ -4089,7 +4480,7 @@ PRIVACY_NOTICE_MD = f"""
 
 **What StudySpace stores about you**
 - **Account:** your name, email, whether you are a student or teacher, your grade, your main goal, your subjects and your study schedule.
-- **What you do in the app:** your chats with the AI tutor and any homework photos you upload, topics saved from your questions (you can switch this off in the sidebar), study logs, quiz results, reminders and a daily usage counter.
+- **What you do in the app:** your chats with the AI tutor and any homework photos you upload, topics saved from your questions (you can switch this off in the sidebar), study logs, quiz results, reminders and a daily usage counter. If you use the Study Planner, also your sleep, school and sport times and your study plan.
 - **Classes:** the classes you create or join, join requests, homework and test dates. A teacher can see the name and email of students in their class.
 - **Staying logged in:** if you stay logged in, only a scrambled (hashed) token is stored, for up to 30 days. Login codes stop working after 10 minutes.
 
@@ -4102,7 +4493,7 @@ PRIVACY_NOTICE_MD = f"""
 - **Gmail (Google):** sends your login code by email.
 - **OneSignal:** if notifications are on, your email is attached to your browser so reminders can reach you.
 
-**How long:** until you delete your account. You can do that in this window, under "Delete my account".
+**How long:** your chats (and the photos in them) are deleted automatically {CHAT_RETENTION_DAYS} days (about 12 months) after you last used them. Everything else is kept until you delete your account. You can do that in this window, under "Delete my account".
 
 **Your choices**
 - **See or download your data:** use the "Download my data" tab.
@@ -4135,6 +4526,8 @@ def record_consent(email):
 def export_user_data(email):
     """Everything StudySpace holds about this person, as a plain dict (for JSON download)."""
     e = email.lower().strip()
+    _ensure_prebuilt_table()
+    _ensure_planner_tables()
     conn = db.connect()
     cursor = conn.cursor()
 
@@ -4159,6 +4552,15 @@ def export_user_data(email):
     out["saved_topics"] = grab(
         "SELECT subject, topic, specific_area, raw_text, timestamp FROM knowledge_items WHERE LOWER(email) = ?",
         (e,), ["subject", "topic", "specific_area", "raw_text", "timestamp"])
+    out["prepared_tests_and_notes"] = grab(
+        "SELECT subject_key, kind, content, created_at FROM prebuilt_study WHERE LOWER(email) = ?",
+        (e,), ["subject", "kind", "content", "created_at"])
+    out["study_planner_times"] = grab(
+        "SELECT kind, day, start_min, end_min FROM weekly_commitments WHERE LOWER(email) = ?",
+        (e,), ["kind", "day (0=Monday, -1=every day)", "start_minute_of_day", "end_minute_of_day"])
+    out["study_plan_blocks"] = grab(
+        "SELECT block_date, start_min, end_min, title, source FROM study_plan_blocks WHERE LOWER(email) = ?",
+        (e,), ["date", "start_minute_of_day", "end_minute_of_day", "title", "source"])
     out["class_memberships"] = grab(
         "SELECT class_id, student_name, status FROM class_enrollment WHERE LOWER(student_email) = ?", (e,),
         ["class_id", "student_name", "status"])
@@ -4197,6 +4599,8 @@ def export_user_data(email):
 def delete_user_account(email):
     """Permanently removes everything StudySpace stores about this person. All-or-nothing."""
     e = email.lower().strip()
+    _ensure_prebuilt_table()  # the pre-built tests/notes table may not exist yet on an older database
+    _ensure_planner_tables()
     conn = db.connect()
     cursor = conn.cursor()
     steps = [
@@ -4207,6 +4611,9 @@ def delete_user_account(email):
         ("DELETE FROM daily_rpd_usage WHERE LOWER(email) = ?", (e,)),
         ("DELETE FROM reminders WHERE LOWER(user_email) = ?", (e,)),
         ("DELETE FROM knowledge_items WHERE LOWER(email) = ?", (e,)),
+        ("DELETE FROM prebuilt_study WHERE LOWER(email) = ?", (e,)),
+        ("DELETE FROM weekly_commitments WHERE LOWER(email) = ?", (e,)),
+        ("DELETE FROM study_plan_blocks WHERE LOWER(email) = ?", (e,)),
         ("DELETE FROM login_tokens WHERE LOWER(email) = ?", (e,)),
         ("DELETE FROM notification_dismissals WHERE LOWER(student_email) = ?", (e,)),
         ("DELETE FROM class_enrollment WHERE LOWER(student_email) = ?", (e,)),
@@ -4587,6 +4994,10 @@ def main():
 
        if st.button("Edit My Profile", use_container_width=True, key="btn_edit_profile"):
            render_edit_profile_dialog(active_profile)
+
+       if active_profile.get("role", "student") != "teacher":
+           if st.button("Study Planner", use_container_width=True, key="btn_study_planner"):
+               render_study_planner(active_profile)
 
        if st.button("Privacy & My Data", use_container_width=True, key="btn_privacy_data"):
            render_privacy_and_data_dialog(active_profile)
