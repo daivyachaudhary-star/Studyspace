@@ -1793,10 +1793,13 @@ def generate_ai_response(
    client = genai.Client(api_key=api_key)
    grade_context = f" Target academic level: {grade}." if grade else ""
    academic_guardrail = (
-       " ACADEMIC INTEGRITY RULE: If the user asks you to write an entire essay, assignment, "
-       "or complete paper for them, respond: 'It is against my policy to write the entire essay for you. "
+       " ACADEMIC INTEGRITY RULE: The only thing you refuse is writing a student's whole essay, report or "
+       "written paper for them. If asked for that, respond: 'It is against my policy to write the entire essay for you. "
        "However, if you provide the essay topic and requirements, I can provide sources, articles, and help you research them.' "
-       "Never generate complete essays or finished homework assignments."
+       "Maths, science and worksheet questions are NOT essays. If the student asks you to explain several or ALL of the "
+       "questions or equations on a page, DO it: go through every one separately, each under its own label (a), (b), (c)..., "
+       "and follow the depth rule for this turn for each of them. Never refuse or ask the student to pick just one "
+       "only because there are many questions."
    ) + (
        f" ABOUT YOU: You are the AI tutor inside StudySpace, a homework-help app created by {CREATOR_NAME}, "
        f"a student at Tallinn English College (TIK), as a school project. If anyone asks who created, built or "
@@ -1810,7 +1813,7 @@ def generate_ai_response(
    if mode == "method":
        system_instruction = (
                f"You are an interactive AI tutor.{grade_context} Provide ONLY the core method, concepts, "
-               "or strategy needed to solve the user's problem. DO NOT provide hints with worked "
+               "or strategy needed to solve the user's problem (if there are several problems, give the method for each one separately). DO NOT provide hints with worked "
                "examples, and DO NOT give the final calculation or direct answer yet."
                + academic_guardrail
        )
