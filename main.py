@@ -2053,42 +2053,88 @@ def _study_looks_ok(kind, text):
    return _is_test_paper(text) if kind == "test" else True
 
 
-def get_prebuilt_status(email):
-   """{(subject_key, kind): fingerprint} for everything saved for this student (one cheap query)."""
-   def _q():
-       conn = db.connect()
+def _ensure_prebuilt_table():
+   """Create the table on first use. (init_db only runs when the app process starts fresh, so a table added
+   later would otherwise be missing on a live database until someone reboots the app.)"""
+   store = _reply_job_store()
+   if store.get("prebuilt_table_ok"):
+       return
+   conn = db.connect()
+   try:
        cursor = conn.cursor()
-       cursor.execute("SELECT subject_key, kind, fingerprint FROM prebuilt_study WHERE LOWER(email) = ?",
-                      (email.lower().strip(),))
-       rows = cursor.fetchall()
+       cursor.execute("""
+           CREATE TABLE IF NOT EXISTS prebuilt_study (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               email TEXT,
+               subject_key TEXT,
+               kind TEXT,
+               fingerprint TEXT,
+               content TEXT,
+               created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(email, subject_key, kind)
+           )
+       """)
+       conn.commit()
+   finally:
        conn.close()
+   store["prebuilt_table_ok"] = True
+
+
+def get_prebuilt_status(email):
+   """{(subject_key, kind): fingerprint} for everything saved for this student (one cheap query).
+   Never raises: if anything is wrong the Home page simply shows no 'Test ready' labels."""
+   def _q():
+       _ensure_prebuilt_table()
+       conn = db.connect()
+       try:
+           cursor = conn.cursor()
+           cursor.execute("SELECT subject_key, kind, fingerprint FROM prebuilt_study WHERE LOWER(email) = ?",
+                          (email.lower().strip(),))
+           rows = cursor.fetchall()
+       finally:
+           conn.close()
        return {(r[0], r[1]): r[2] for r in rows}
-   return _run_cached(("prebuilt", email), _q)
+   try:
+       return _run_cached(("prebuilt", email), _q)
+   except Exception as e:  # noqa: BLE001
+       print(f"[prebuild] status check failed: {e}", flush=True)
+       return {}
 
 
 def get_prebuilt_content(email, subject_name, kind, fingerprint):
-   conn = db.connect()
-   cursor = conn.cursor()
-   cursor.execute(
-       "SELECT content FROM prebuilt_study WHERE LOWER(email) = ? AND subject_key = ? AND kind = ? AND fingerprint = ?",
-       (email.lower().strip(), _study_key(subject_name), kind, str(fingerprint)),
-   )
-   row = cursor.fetchone()
-   conn.close()
-   return row[0] if row else None
+   """The saved test/notes if one exists and is still fresh, otherwise None. Never raises."""
+   try:
+       _ensure_prebuilt_table()
+       conn = db.connect()
+       try:
+           cursor = conn.cursor()
+           cursor.execute(
+               "SELECT content FROM prebuilt_study WHERE LOWER(email) = ? AND subject_key = ? AND kind = ? AND fingerprint = ?",
+               (email.lower().strip(), _study_key(subject_name), kind, str(fingerprint)),
+           )
+           row = cursor.fetchone()
+       finally:
+           conn.close()
+       return row[0] if row else None
+   except Exception as e:  # noqa: BLE001
+       print(f"[prebuild] read failed: {e}", flush=True)
+       return None
 
 
 def save_prebuilt(email, subject_name, kind, fingerprint, content):
+   _ensure_prebuilt_table()
    conn = db.connect()
-   cursor = conn.cursor()
-   cursor.execute("DELETE FROM prebuilt_study WHERE LOWER(email) = ? AND subject_key = ? AND kind = ?",
-                  (email.lower().strip(), _study_key(subject_name), kind))
-   cursor.execute(
-       "INSERT INTO prebuilt_study (email, subject_key, kind, fingerprint, content) VALUES (?, ?, ?, ?, ?)",
-       (email.lower().strip(), _study_key(subject_name), kind, str(fingerprint), content),
-   )
-   conn.commit()
-   conn.close()
+   try:
+       cursor = conn.cursor()
+       cursor.execute("DELETE FROM prebuilt_study WHERE LOWER(email) = ? AND subject_key = ? AND kind = ?",
+                      (email.lower().strip(), _study_key(subject_name), kind))
+       cursor.execute(
+           "INSERT INTO prebuilt_study (email, subject_key, kind, fingerprint, content) VALUES (?, ?, ?, ?, ?)",
+           (email.lower().strip(), _study_key(subject_name), kind, str(fingerprint), content),
+       )
+       conn.commit()
+   finally:
+       conn.close()
 
 
 def _study_count(email, subject_name):
