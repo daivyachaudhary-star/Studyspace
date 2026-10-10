@@ -250,6 +250,20 @@ def init_db():
        )
    """)
 
+   # Practice tests / study notes that were built ahead of time, so they open instantly.
+   cursor.execute("""
+       CREATE TABLE IF NOT EXISTS prebuilt_study (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           email TEXT,
+           subject_key TEXT,
+           kind TEXT,
+           fingerprint TEXT,
+           content TEXT,
+           created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+           UNIQUE(email, subject_key, kind)
+       )
+   """)
+
    cursor.execute("""
        CREATE TABLE IF NOT EXISTS notification_dismissals (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1677,6 +1691,10 @@ def extract_and_store_topic_details(prompt, image_bytes, mime_type, user_email):
                specific_area=data.get("specific_area", prompt[:50]),
                raw_text=data.get("content_summary") or prompt,
            )
+           try:
+               prebuild_test_async(user_email, data.get("subject", "General"))
+           except Exception as _e:  # noqa: BLE001
+               print(f"[prebuild] could not start: {_e}", flush=True)
            break
        except Exception as e:
            err = str(e)
@@ -1942,7 +1960,7 @@ def fetch_study_subjects(email):
    return _run_cached(("study_subjects", email), lambda: _fetch_study_subjects_uncached(email))
 
 
-def generate_study_notes_from_memory(user_email, target_subject=None):
+def generate_study_notes_from_memory(user_email, target_subject=None, charge=True):
    stored_items = fetch_stored_topics(user_email, subject=target_subject)
    if not stored_items:
        return f"No study history found{' for ' + target_subject if target_subject else ''} yet. Upload a screenshot or ask a question to start building study notes!"
@@ -1958,12 +1976,12 @@ def generate_study_notes_from_memory(user_email, target_subject=None):
        f"revision notes a student could read in 10 minutes. Wherever an entry above has 'Actual content seen', "
        f"use those specific problems for the examples."
    )
-   return generate_ai_response(prompt, mode="full", user_email=user_email)
+   return generate_ai_response(prompt, mode="full", user_email=user_email if charge else "")
 
 
 
 
-def generate_mock_test_from_memory(user_email, target_subject=None):
+def generate_mock_test_from_memory(user_email, target_subject=None, charge=True):
    stored_items = fetch_stored_topics(user_email, subject=target_subject)
    if not stored_items:
        return f"No study history found{' for ' + target_subject if target_subject else ''} yet. Upload a screenshot or ask a question to start building practice tests!"
@@ -1978,7 +1996,7 @@ def generate_mock_test_from_memory(user_email, target_subject=None):
    prompt = (
        f"Based on the student's study topics and past uploaded assignments:\n{memory_summary}\n\n"
        f"Write an official-looking school test paper with AT LEAST 10 numbered questions (12 is ideal), "
-       f"aimed at helping the student prepare. Wherever an entry above has 'Actual content seen', base questions on "
+       f"aimed at helping the student prepare, with questions only and no answers. Wherever an entry above has 'Actual content seen', base questions on "
        f"those specific problems (same style, or close variations) instead of generic textbook questions. "
        f"Use EXACTLY this layout in Markdown, with no text before the first line:\n\n"
        f"# Practice Test: {subject_title}\n\n"
@@ -1990,17 +2008,135 @@ def generate_mock_test_from_memory(user_email, target_subject=None):
        f"## Section B: Problem solving\n(questions 5 to 9, three or four marks each)\n\n"
        f"## Section C: Extended questions\n(question 10 and above, five or more marks each)\n\n"
        f"Number the questions continuously (1, 2, 3, ...) and write the marks at the end of each question like **[2 marks]**. "
-       f"Leave a line break between questions. Do NOT put answers inside the question sections. "
-       f"After the last question add a horizontal rule and a final section titled "
-       f"'## Answer key and worked solutions' with the full step-by-step solution to every question, "
-       f"then 'Key points to revise' (3 to 5 short points). Keep a formal, exam-paper tone."
+       f"Leave a line break between questions. "
+       f"IMPORTANT: this is a TEST PAPER, so do NOT include any answers, answer key, worked solutions, hints, "
+       f"final results or example answers anywhere, not even at the end. Only the questions. "
+       f"Finish with a horizontal rule and this exact line in italics: "
+       f"*When you have finished, send me your answers one question at a time and I will guide you through them.* "
+       f"Keep a formal, exam-paper tone."
    )
-   _res = generate_ai_response(prompt, mode="full", user_email=user_email)
+   _res = generate_ai_response(prompt, mode="full", user_email=user_email if charge else "")
    # Keep only the paper itself (the model sometimes adds a greeting or wraps it in a code block).
    _at = _res.find("# Practice Test")
    if _at > 0:
        _res = _res[_at:]
-   return _res.replace("```markdown", "").replace("```", "").strip() if _at >= 0 else _res
+   if _at < 0:
+       return _res
+   _res = _res.replace("```markdown", "").replace("```", "").strip()
+   # Safety net: a test paper never carries answers. Cut anything from an answer / solution heading onwards.
+   _cut = re.search(r"^\s*#{1,4}\s*(answer key|answers|worked solutions|solutions|mark scheme|model answers)",
+                    _res, flags=re.IGNORECASE | re.MULTILINE)
+   if _cut:
+       _res = _res[:_cut.start()].rstrip().rstrip("-").rstrip()
+   _footer = "*When you have finished, send me your answers one question at a time and I will guide you through them.*"
+   if "send me your answers" not in _res:
+       _res = _res + "\n\n---\n\n" + _footer
+   return _res
+
+
+
+
+# ---------------------------------------------------------------------------
+# Tests and notes that are built ahead of time. The result is saved with a "fingerprint" (how many topics
+# the student had saved for that subject). If new topics are saved the fingerprint changes, the old copy
+# is ignored and a fresh one is built in the background. Opening a ready one is instant and free.
+# ---------------------------------------------------------------------------
+def _study_key(name):
+   return (name or "").strip().lower()
+
+
+def _study_looks_ok(kind, text):
+   if not isinstance(text, str) or len(text) < 300:
+       return False
+   if text.startswith(("Your ", "StudySpace has used", "The tutor", "Something went wrong", "No study history", "Server Proxy")):
+       return False
+   return _is_test_paper(text) if kind == "test" else True
+
+
+def get_prebuilt_status(email):
+   """{(subject_key, kind): fingerprint} for everything saved for this student (one cheap query)."""
+   def _q():
+       conn = db.connect()
+       cursor = conn.cursor()
+       cursor.execute("SELECT subject_key, kind, fingerprint FROM prebuilt_study WHERE LOWER(email) = ?",
+                      (email.lower().strip(),))
+       rows = cursor.fetchall()
+       conn.close()
+       return {(r[0], r[1]): r[2] for r in rows}
+   return _run_cached(("prebuilt", email), _q)
+
+
+def get_prebuilt_content(email, subject_name, kind, fingerprint):
+   conn = db.connect()
+   cursor = conn.cursor()
+   cursor.execute(
+       "SELECT content FROM prebuilt_study WHERE LOWER(email) = ? AND subject_key = ? AND kind = ? AND fingerprint = ?",
+       (email.lower().strip(), _study_key(subject_name), kind, str(fingerprint)),
+   )
+   row = cursor.fetchone()
+   conn.close()
+   return row[0] if row else None
+
+
+def save_prebuilt(email, subject_name, kind, fingerprint, content):
+   conn = db.connect()
+   cursor = conn.cursor()
+   cursor.execute("DELETE FROM prebuilt_study WHERE LOWER(email) = ? AND subject_key = ? AND kind = ?",
+                  (email.lower().strip(), _study_key(subject_name), kind))
+   cursor.execute(
+       "INSERT INTO prebuilt_study (email, subject_key, kind, fingerprint, content) VALUES (?, ?, ?, ?, ?)",
+       (email.lower().strip(), _study_key(subject_name), kind, str(fingerprint), content),
+   )
+   conn.commit()
+   conn.close()
+
+
+def _study_count(email, subject_name):
+   conn = db.connect()
+   cursor = conn.cursor()
+   cursor.execute("SELECT COUNT(*) FROM knowledge_items WHERE LOWER(email) = ? AND LOWER(TRIM(subject)) = ?",
+                  (email.lower().strip(), _study_key(subject_name)))
+   n = cursor.fetchone()[0]
+   conn.close()
+   return n
+
+
+def prebuild_test_async(email, subject_name, fingerprint=None):
+   """Build the practice test for a subject in the background (free for the student, counted in the shared cap)."""
+   if not email or not subject_name or _study_key(subject_name) in ("", "general"):
+       return
+   store = _reply_job_store()
+   key = (email.lower().strip(), _study_key(subject_name), "test")
+   with store["lock"]:
+       building = store.setdefault("building", set())
+       if key in building:
+           return
+       last_try = store.setdefault("last_try", {})
+       _ck = (key, fingerprint)
+       if fingerprint is not None and time.time() - last_try.get(_ck, 0) < 600:
+           return  # this exact version was tried in the last 10 minutes (e.g. it failed): do not hammer the AI
+       last_try[_ck] = time.time()
+       building.add(key)
+
+   def work():
+       try:
+           fp = fingerprint if fingerprint is not None else _study_count(email, subject_name)
+           if get_prebuilt_content(email, subject_name, "test", fp) is not None:
+               return  # already fresh
+           if GLOBAL_DAILY_CAP and _global_used_today() >= GLOBAL_DAILY_CAP:
+               return
+           text = generate_mock_test_from_memory(email, target_subject=subject_name, charge=False)
+           if _study_looks_ok("test", text):
+               save_prebuilt(email, subject_name, "test", fp, text)
+               _global_add()
+               print(f"[prebuild] test ready subject={subject_name}", flush=True)
+       except Exception as e:  # noqa: BLE001
+           print(f"[prebuild] failed: {e}", flush=True)
+       finally:
+           with store["lock"]:
+               store["building"].discard(key)
+
+   threading.Thread(target=work, name="ss-reply-prebuild", daemon=True).start()
 
 
 
@@ -3482,6 +3618,14 @@ def render_home_page(profile):
                st.session_state["page"] = "AI Tutor"
                st.rerun()
    else:
+       try:
+           _home_prebuilt = get_prebuilt_status(user_email)
+           for _subj in study_subjects[:3]:  # get the newest subjects' tests ready in the background
+               if _home_prebuilt.get((_study_key(_subj["name"]), "test")) != str(_subj.get("count", 0)):
+                   prebuild_test_async(user_email, _subj["name"], _subj.get("count", 0))
+       except Exception as _e:  # noqa: BLE001
+           _home_prebuilt = {}
+           print(f"[prebuild] home check failed: {_e}", flush=True)
        for row_start in range(0, len(study_subjects), 3):
            card_cols = st.columns(3)
            for col, subj in zip(card_cols, study_subjects[row_start:row_start + 3]):
@@ -3490,18 +3634,20 @@ def render_home_page(profile):
                        _label = subj["name"] if not subj["name"].islower() else subj["name"].title()
                        st.markdown(f"**{_label}**")
                        _n = subj.get("count", 0)
-                       st.caption(f"{_n} saved topic{'s' if _n != 1 else ''}")
+                       _ready_map = _home_prebuilt
+                       _test_ready = _ready_map.get((_study_key(subj["name"]), "test")) == str(_n)
+                       st.caption(f"{_n} saved topic{'s' if _n != 1 else ''}" + ("  |  Test ready" if _test_ready else ""))
                        if subj["topics"]:
                            st.caption(", ".join(t[:28] for t in subj["topics"][:2]))
                        _k = "".join(ch if ch.isalnum() else "_" for ch in subj["name"].lower())[:40]
                        b1, b2 = st.columns(2)
                        with b1:
                            if st.button("Practice test", key=f"study_test_{row_start}_{_k}", use_container_width=True):
-                               _open_study_chat(user_email, subj["name"], _label, "test")
+                               _open_study_chat(user_email, subj["name"], _label, "test", subj.get("count", 0))
                        with b2:
                            if st.button("Study notes", key=f"study_notes_{row_start}_{_k}", use_container_width=True):
-                               _open_study_chat(user_email, subj["name"], _label, "notes")
-   st.caption("Each practice test or set of notes uses 1 of your daily requests.")
+                               _open_study_chat(user_email, subj["name"], _label, "notes", subj.get("count", 0))
+   st.caption("Practice tests are prepared in advance and open instantly. Study notes, and tests that are not ready yet, use 1 of your daily requests.")
 
    sw1, sw2, sw3 = st.columns(3)
    with sw2:
@@ -3565,18 +3711,37 @@ def _start_reply_job(chat_session_id, user_email, prompt, help_stage, ai_kwargs=
    return job_id
 
 
-def _open_study_chat(user_email, subject_name, label, kind):
-   """Home 'Practice test' / 'Study notes' buttons: jump to the AI Tutor straight away and let the
-   test or notes be written in the background, so clicking elsewhere cannot cancel them."""
+def _open_study_chat(user_email, subject_name, label, kind, count=None):
+   """Home 'Practice test' / 'Study notes' buttons. If a finished copy is saved, show it at once (free).
+   Otherwise jump to the AI Tutor and write it in the background, so clicking elsewhere cannot cancel it."""
    what = "practice test" if kind == "test" else "study notes"
    user_line = f"Study for a test: {label} ({what})"
+   if count is None:
+       count = _study_count(user_email, subject_name)
+   ready = get_prebuilt_content(user_email, subject_name, kind, count)
+   if ready:
+       st.session_state["messages"] = [
+           {"role": "user", "content": user_line},
+           {"role": "assistant", "content": ready, "help_stage": 3},
+       ]
+       start_new_chat_session(user_email, st.session_state["messages"])
+       st.session_state["page"] = "AI Tutor"
+       st.rerun()
+       return
    st.session_state["messages"] = [{"role": "user", "content": user_line}]
    chat_id = start_new_chat_session(user_email, st.session_state["messages"])
    maker = generate_mock_test_from_memory if kind == "test" else generate_study_notes_from_memory
-   st.session_state["pending_job"] = _start_reply_job(
-       chat_id, user_email, user_line, 3,
-       producer=lambda: maker(user_email, target_subject=subject_name),
-   )
+
+   def produce():
+       text = maker(user_email, target_subject=subject_name)
+       if _study_looks_ok(kind, text):
+           try:
+               save_prebuilt(user_email, subject_name, kind, count, text)
+           except Exception as e:  # noqa: BLE001
+               print(f"[prebuild] could not save: {e}", flush=True)
+       return text
+
+   st.session_state["pending_job"] = _start_reply_job(chat_id, user_email, user_line, 3, producer=produce)
    st.session_state["page"] = "AI Tutor"
    st.rerun()
 
