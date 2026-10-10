@@ -292,6 +292,8 @@ def init_db():
 def _run_cached(key, fn):
     if not db.USING_POSTGRES:
         return fn()
+    if threading.current_thread().name.startswith("ss-reply"):
+        return fn()  # background reply job: no access to the page's session state
     import copy
     cache = st.session_state.setdefault("_run_cache", {})
     hit = cache.get(key)
@@ -3488,6 +3490,64 @@ def render_home_page(profile):
 # =========================================================
 # AI TUTOR PAGE (CLEAN CHAT LANDING & INPUT)
 # =========================================================
+# ---------------------------------------------------------------------------
+# AI replies run in the background. Streamlit re-runs the whole page on every click, which used to
+# cancel a reply that was still being written. Now the reply is produced by a background thread that
+# a click cannot stop: it saves the answer to the chat history itself, and the page picks it up the
+# next time the student looks at the AI Tutor.
+# ---------------------------------------------------------------------------
+REPLY_TIMEOUT_SECONDS = 180
+
+
+@st.cache_resource
+def _reply_job_store():
+   return {"lock": threading.Lock(), "jobs": {}}
+
+
+def _start_reply_job(chat_session_id, user_email, prompt, help_stage, ai_kwargs):
+   store = _reply_job_store()
+   job_id = _token_urlsafe(8)
+   job = {
+       "status": "running",
+       "started": time.time(),
+       "chat_session_id": chat_session_id,
+       "reply": None,
+       "abandoned": False,
+       "help_stage": help_stage,
+       "prompt": prompt,
+   }
+   with store["lock"]:
+       for old_id in [k for k, v in store["jobs"].items() if time.time() - v["started"] > 3600]:
+           store["jobs"].pop(old_id, None)
+       store["jobs"][job_id] = job
+
+   def work():
+       try:
+           reply = generate_ai_response(**ai_kwargs)
+       except Exception as e:  # noqa: BLE001
+           print(f"[reply-job] failed: {e}", flush=True)
+           refund_rpd(user_email)
+           reply = "Something went wrong while writing the answer. Please try again."
+       with store["lock"]:
+           if job["abandoned"]:
+               return
+       try:
+           save_chat_message(chat_session_id, "assistant", reply, help_stage=help_stage, original_prompt=prompt)
+       except Exception as e:  # noqa: BLE001
+           print(f"[reply-job] could not save reply: {e}", flush=True)
+       job["reply"] = reply
+       job["status"] = "done"
+
+   threading.Thread(target=work, name=f"ss-reply-{job_id}", daemon=True).start()
+   return job_id
+
+
+def _get_reply_job(job_id):
+   if not job_id:
+       return None
+   return _reply_job_store()["jobs"].get(job_id)
+
+
 def render_tutor(profile):
    user_name = profile["name"] if profile else "Student"
    user_email = profile["email"] if profile else ""
@@ -3520,17 +3580,47 @@ def render_tutor(profile):
        )
 
 
-   for msg in st.session_state.messages:
-       with st.chat_message(msg["role"]):
-           if msg.get("image_bytes"):
-               st.image(msg["image_bytes"], caption="Uploaded Screenshot", width=300)
-           st.markdown(msg["content"])
-
+   # A reply may still be being written (or have finished) while the student was on another page.
+   current_chat_id = st.session_state.get("current_chat_session_id")
+   pending_id = st.session_state.get("pending_job")
+   pending_job = _get_reply_job(pending_id)
+   if pending_id and pending_job is None:
+       st.session_state.pop("pending_job", None)  # the server restarted or the job expired
+       pending_id = None
+   if pending_job and pending_job["status"] == "done":
+       reply_text = pending_job["reply"]
+       if pending_job["chat_session_id"] == current_chat_id:
+           msgs = st.session_state.messages
+           already_there = bool(msgs) and msgs[-1].get("role") == "assistant" and msgs[-1].get("content") == reply_text
+           if not already_there:
+               msgs.append({
+                   "role": "assistant",
+                   "content": reply_text,
+                   "help_stage": pending_job["help_stage"],
+                   "original_prompt": pending_job["prompt"],
+               })
+       st.session_state.pop("pending_job", None)
+       pending_job = None
+   elif pending_job and time.time() - pending_job["started"] > REPLY_TIMEOUT_SECONDS:
+       with _reply_job_store()["lock"]:
+           pending_job["abandoned"] = True
+       refund_rpd(user_email)
+       st.session_state.pop("pending_job", None)
+       if pending_job["chat_session_id"] == current_chat_id:
+           st.session_state.messages.append({
+               "role": "assistant",
+               "content": "The tutor took too long to answer. Please try again.",
+               "help_stage": 1,
+               "original_prompt": pending_job["prompt"],
+           })
+       pending_job = None
+   waiting_here = bool(pending_job) and pending_job["chat_session_id"] == current_chat_id
 
    chat_input_data = st.chat_input(
        "Ask a question or drop a screenshot here...",
        accept_file=True,
        file_type=["png", "jpg", "jpeg", "webp"],
+       disabled=waiting_here,
    )
 
 
@@ -3570,12 +3660,6 @@ def render_tutor(profile):
        )
 
 
-       with st.chat_message("user"):
-           if image_bytes:
-               st.image(image_bytes, caption="Uploaded Screenshot", width=300)
-           st.markdown(prompt)
-
-
        # 3-step tutor rule: step 1 = method only, step 2 = a hint with a similar
        # worked example (triggered when the student says they're confused), step 3 =
        # the full walkthrough (triggered if they're still confused after the hint).
@@ -3593,32 +3677,41 @@ def render_tutor(profile):
        stage_to_mode = {1: "method", 2: "hint", 3: "full"}
        chosen_mode = stage_to_mode[next_help_stage]
 
-       with st.chat_message("assistant"):
-           with st.spinner("Analyzing screenshot and thinking..." if image_bytes else "Thinking..."):
-               reply = generate_ai_response(
-                   prompt,
-                   image_bytes=image_bytes,
-                   mime_type=mime_type,
-                   mode=chosen_mode,
-                   user_tier=user_tier,
-                   grade=user_grade,
-                   user_email=user_email,
-                   history=st.session_state.messages[:-1],
-               )
-
-
-       st.session_state.messages.append(
-           {
-               "role": "assistant",
-               "content": reply,
-               "help_stage": next_help_stage,
-               "original_prompt": prompt,
-           }
-       )
-       save_chat_message(
+       st.session_state["pending_job"] = _start_reply_job(
            st.session_state["current_chat_session_id"],
-           "assistant", reply, help_stage=next_help_stage, original_prompt=prompt,
+           user_email,
+           prompt,
+           next_help_stage,
+           dict(
+               prompt=prompt,
+               image_bytes=image_bytes,
+               mime_type=mime_type,
+               mode=chosen_mode,
+               user_tier=user_tier,
+               grade=user_grade,
+               user_email=user_email,
+               history=list(st.session_state.messages[:-1]),
+           ),
        )
+       st.rerun()
+
+   # Show the conversation (after any finished reply has been added to it).
+   for msg in st.session_state.messages:
+       with st.chat_message(msg["role"]):
+           if msg.get("image_bytes"):
+               st.image(msg["image_bytes"], caption="Uploaded Screenshot", width=300)
+           st.markdown(msg["content"])
+
+   # Still writing the answer: wait here. Clicking anything else interrupts only this waiting loop,
+   # not the reply itself, which keeps going in the background.
+   if waiting_here:
+       last_user = next((m for m in reversed(st.session_state.messages) if m.get("role") == "user"), {})
+       with st.chat_message("assistant"):
+           with st.spinner("Analyzing screenshot and thinking..." if last_user.get("image_bytes") else "Thinking..."):
+               for _ in range(240):  # up to about 2 minutes per run, then it starts again
+                   if pending_job["status"] != "running":
+                       break
+                   time.sleep(0.5)
        st.rerun()
 
 
