@@ -1,21 +1,22 @@
 """StudySpace study-gap planner.
 
-Finds the free time left in a student's week after sleep, school, sport (and anything else
+Finds the free time left in a student's week after school, sport (and anything else
 they add), then fits study blocks for upcoming tests and homework into those gaps.
 
 The rules are plain Python on purpose, so the plan can be explained and tested:
   * Times are minutes after midnight (0 to 1440).
-  * A study block is never placed inside sleep, school, sport or "other" time.
-  * A 60 minute wind-down before bed, 30 minutes after waking and a 30 minute rest after sport are also kept free.
+  * A study block is never placed inside school, sport or "other" time.
+  * Study hours: nothing is placed before school has finished on a school day (or before 09:00 on a day
+    without school) and nothing is placed after 20:30. A 30 minute rest after sport is also kept free.
   * Blocks are 30 to 90 minutes long, with a 10 minute break after each one.
 """
 import datetime
 import math
 
 DAY_MIN = 1440
-WIND_DOWN_BEFORE_BED = 60
+STUDY_END = 20 * 60 + 30         # no study block may end after 20:30
+NON_SCHOOL_DAY_START = 9 * 60    # on a day without school, no study before 09:00
 REST_AFTER_SPORT = 30
-WAKE_UP_BUFFER = 30
 MIN_BLOCK = 30
 MAX_BLOCK = 90
 BREAK_AFTER_BLOCK = 10
@@ -23,10 +24,9 @@ HOMEWORK_MIN = 45
 TEST_TOTAL_MIN = 180
 TEST_SESSIONS = 3
 
-KINDS = ("sleep", "school", "sport", "other")
+KINDS = ("school", "sport", "other")
 
 DEFAULT_COMMITMENTS = {
-    "sleep": (23 * 60, 7 * 60),
     "school": [(d, 8 * 60 + 30, 15 * 60 + 30) for d in range(5)],
     "sport": [],
     "other": [],
@@ -57,19 +57,21 @@ def _overlaps(s1, e1, s2, e2):
 
 
 def blocked_by_kind(day, c, buffers=False):
-    """{kind: [(start, end), ...]} for one date. With buffers=True the wind-down and sport rest are added."""
+    """{kind: [(start, end), ...]} for one date. kind 'hours' is the time outside the study hours
+    (before school has finished, or before 09:00 on a day without school, and after 20:30).
+    With buffers=True the 30 minute rest after sport is added."""
     out = {k: [] for k in KINDS}
-    bed, wake = c["sleep"]
-    if bed > wake:                      # e.g. 23:00 -> 07:00, sleeping across midnight
-        out["sleep"] += [(0, min(DAY_MIN, wake + WAKE_UP_BUFFER) if buffers else wake), (max(0, bed - WIND_DOWN_BEFORE_BED) if buffers else bed, DAY_MIN)]
-    elif bed < wake:                    # e.g. 01:00 -> 09:00, sleeping after midnight
-        out["sleep"] += [(max(0, bed - WIND_DOWN_BEFORE_BED) if buffers else bed, min(DAY_MIN, wake + WAKE_UP_BUFFER) if buffers else wake)]
     wd = day.weekday()
-    for kind in ("school", "sport", "other"):
+    school_end = None
+    for kind in KINDS:
         for d, s, e in c.get(kind, []):
             if d == wd and e > s:
                 extra = REST_AFTER_SPORT if (buffers and kind == "sport") else 0
                 out[kind].append((s, min(DAY_MIN, e + extra)))
+                if kind == "school":
+                    school_end = e if school_end is None else max(school_end, e)
+    day_start = school_end if school_end is not None else NON_SCHOOL_DAY_START
+    out["hours"] = [(0, min(DAY_MIN, day_start)), (STUDY_END, DAY_MIN)]
     return out
 
 
@@ -102,7 +104,7 @@ def count_conflicts(blocks, c):
     """Independent check of a finished plan.
     blocks: list of dicts with 'date' (datetime.date), 'start', 'end'.
     Returns totals, overall and per kind, so the success criterion can be measured."""
-    res = {"total": len(blocks), "any": 0, "sleep": 0, "school": 0, "sport": 0, "other": 0}
+    res = {"total": len(blocks), "any": 0, "hours": 0, "school": 0, "sport": 0, "other": 0}
     for b in blocks:
         hit = block_conflicts(b["date"], b["start"], b["end"], c)
         if hit:

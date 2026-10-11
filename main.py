@@ -1,7 +1,7 @@
 import os
 import re
 import db  # database layer: hosted Postgres (Supabase) or local SQLite file
-import planner  # study-gap planner: fits study blocks around sleep, school and sport
+import planner  # study-gap planner: fits study blocks around school and sport, between school and 20:30
 import datetime
 import json
 import base64
@@ -2315,11 +2315,9 @@ def load_commitments(email):
        conn.close()
    if not rows:
        return {k: (list(v) if isinstance(v, list) else v) for k, v in planner.DEFAULT_COMMITMENTS.items()}, False
-   c = {"sleep": planner.DEFAULT_COMMITMENTS["sleep"], "school": [], "sport": [], "other": []}
+   c = {"school": [], "sport": [], "other": []}
    for kind, day, s, e in rows:
-       if kind == "sleep":
-           c["sleep"] = (int(s), int(e))
-       elif kind in c:
+       if kind in c:
            c[kind].append((int(day), int(s), int(e)))
    return c, True
 
@@ -2331,8 +2329,6 @@ def save_commitments(email, c):
    try:
        cursor = conn.cursor()
        cursor.execute("DELETE FROM weekly_commitments WHERE LOWER(email) = ?", (e,))
-       cursor.execute("INSERT INTO weekly_commitments (email, kind, day, start_min, end_min) VALUES (?, 'sleep', -1, ?, ?)",
-                      (e, int(c["sleep"][0]), int(c["sleep"][1])))
        for kind in ("school", "sport", "other"):
            for d, s, en in c.get(kind, []):
                cursor.execute("INSERT INTO weekly_commitments (email, kind, day, start_min, end_min) VALUES (?, ?, ?, ?, ?)",
@@ -2503,99 +2499,145 @@ def _planner_build_cb(email):
        st.session_state["pl_msg"] = ("success", f"Built {n} study blocks. Alerts are set for about 10 minutes before each one.")
 
 
+_PL_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _planner_open_questions_cb():
+   st.session_state["pl_ask"] = True
+   st.session_state.pop("pl_msg", None)
+
+
+def _planner_close_questions_cb():
+   st.session_state["pl_ask"] = False
+
+
+def _planner_create_cb(email):
+   """Reads the answers from the question panel, saves them as the student's weekly times and builds the plan."""
+   ss = st.session_state
+   c_old, _saved = load_commitments(email)
+   new_c = {"school": [], "sport": [], "other": list(c_old.get("other", []))}
+   problems = []
+
+   def read_days(kind, days_key, label):
+       for day in ss.get(days_key, []):
+           if day not in _PL_DAYS:
+               continue
+           di = _PL_DAYS.index(day)
+           s, en = ss.get(f"pl_{kind}_s_{di}"), ss.get(f"pl_{kind}_e_{di}")
+           if s is None or en is None:
+               problems.append(f"Fill in the {label} times for {day}.")
+               continue
+           sm, em = planner.to_min(s), planner.to_min(en)
+           if em <= sm:
+               problems.append(f"{day}: {label} has to end after it starts.")
+               continue
+           new_c[kind].append((di, sm, em))
+
+   read_days("school", "pl_school_days", "school")
+   if ss.get("pl_sport_yn") == "Yes":
+       read_days("sport", "pl_sport_days", "training")
+       if not ss.get("pl_sport_days"):
+           problems.append("Pick the days you have training, or choose No.")
+   for d, s, e in new_c["sport"]:
+       for d2, s2, e2 in new_c["school"]:
+           if d == d2 and planner._overlaps(s, e, s2, e2):
+               problems.append(f"{_PL_DAYS[d]}: your training is at the same time as school.")
+   if problems:
+       ss["pl_msg"] = ("warning", " ".join(dict.fromkeys(problems)))
+       return
+   save_commitments(email, new_c)
+   ss["pl_ask"] = False
+   _planner_build_cb(email)
+
+
+def _planner_questions(email, c, saved):
+   """The 'tell us about your week' panel that opens when the student presses Build my study plan."""
+   with st.container(border=True):
+       st.markdown("**Two quick questions, so your study blocks never land in school or training time**")
+       school_by_day = {d: (s, e) for d, s, e in c.get("school", [])}
+       sport_by_day = {d: (s, e) for d, s, e in c.get("sport", [])}
+       default_school = [_PL_DAYS[d] for d in sorted(school_by_day)] if saved else _PL_DAYS[:5]
+
+       def tm(m):
+           return datetime.time(m // 60, m % 60)
+
+       st.markdown("**1. Which days do you have school, and what time is it?**")
+       school_days = st.multiselect("School days", _PL_DAYS, default=default_school, key="pl_school_days")
+       if school_days:
+           h0, h1, h2 = st.columns([1.3, 1, 1])
+           h1.caption("School starts")
+           h2.caption("School ends")
+       for day in sorted(school_days, key=_PL_DAYS.index):
+           di = _PL_DAYS.index(day)
+           ds, de = school_by_day.get(di, (8 * 60 + 30, 15 * 60 + 30))
+           a0, a1, a2 = st.columns([1.3, 1, 1])
+           a0.markdown(f"<div style='padding-top:0.55rem'><b>{day}</b></div>", unsafe_allow_html=True)
+           a1.time_input(f"{day}: school starts", tm(ds), key=f"pl_school_s_{di}", label_visibility="collapsed")
+           a2.time_input(f"{day}: school ends", tm(de), key=f"pl_school_e_{di}", label_visibility="collapsed")
+
+       st.markdown("**2. Do you have sports training?**")
+       st.radio("Sports training", ["No", "Yes"], index=1 if sport_by_day else 0, horizontal=True,
+                key="pl_sport_yn", label_visibility="collapsed")
+       if st.session_state.get("pl_sport_yn") == "Yes":
+           sport_days = st.multiselect("Training days", _PL_DAYS, default=[_PL_DAYS[d] for d in sorted(sport_by_day)], key="pl_sport_days")
+           if sport_days:
+               g0, g1, g2 = st.columns([1.3, 1, 1])
+               g1.caption("Training starts")
+               g2.caption("Training ends")
+           for day in sorted(sport_days, key=_PL_DAYS.index):
+               di = _PL_DAYS.index(day)
+               ds, de = sport_by_day.get(di, (17 * 60, 18 * 60 + 30))
+               b0, b1, b2 = st.columns([1.3, 1, 1])
+               b0.markdown(f"<div style='padding-top:0.55rem'><b>{day}</b></div>", unsafe_allow_html=True)
+               b1.time_input(f"{day}: training starts", tm(ds), key=f"pl_sport_s_{di}", label_visibility="collapsed")
+               b2.time_input(f"{day}: training ends", tm(de), key=f"pl_sport_e_{di}", label_visibility="collapsed")
+
+       st.caption("Study blocks are only placed after school has finished and never after 20:30.")
+       q1, q2 = st.columns([2, 1])
+       q1.button("Create my study plan", key="pl_create_btn", type="primary", on_click=_planner_create_cb, args=(email,))
+       q2.button("Cancel", key="pl_cancel_btn", on_click=_planner_close_questions_cb)
+
+
 @st.dialog("Study Planner", width="large")
 def render_study_planner(profile):
    email = profile["email"]
    c, saved = load_commitments(email)
-   tab_plan, tab_times = st.tabs(["My study plan", "My weekly times"])
-   day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-
-   with tab_times:
-       st.caption("Tell StudySpace when you are busy. Study blocks are only placed in the free time left over, "
-                  "never in your sleep, school or sport time.")
-       if not saved:
-           st.info("These are starting values. Change them to match your week and press Save.")
-       bed_default = datetime.time(c["sleep"][0] // 60, c["sleep"][0] % 60)
-       wake_default = datetime.time(c["sleep"][1] // 60, c["sleep"][1] % 60)
-       sc1, sc2 = st.columns(2)
-       with sc1:
-           bed = st.time_input("Bedtime", bed_default, key="pl_bed")
-       with sc2:
-           wake = st.time_input("Wake-up time", wake_default, key="pl_wake")
-       st.markdown("**School, sport and other fixed times** (add one row for each)")
-       rows = []
-       for kind in ("school", "sport", "other"):
-           for d, s, en in c.get(kind, []):
-               rows.append({"Type": kind, "Day": day_names[d], "Start": datetime.time(s // 60, s % 60),
-                            "End": datetime.time(en // 60, en % 60)})
-       edited = st.data_editor(
-           rows or [{"Type": "sport", "Day": "Monday", "Start": datetime.time(17, 0), "End": datetime.time(18, 30)}][:0],
-           num_rows="dynamic", use_container_width=True, key="pl_rows_editor",
-           column_config={
-               "Type": st.column_config.SelectboxColumn("Type", options=["school", "sport", "other"], required=True),
-               "Day": st.column_config.SelectboxColumn("Day", options=day_names, required=True),
-               "Start": st.column_config.TimeColumn("Start", format="HH:mm", required=True),
-               "End": st.column_config.TimeColumn("End", format="HH:mm", required=True),
-           },
-       )
-       if st.button("Save my weekly times", key="pl_save_times", type="primary"):
-           new_c = {"sleep": (planner.to_min(bed), planner.to_min(wake)), "school": [], "sport": [], "other": []}
-           problems = []
-           for row in (edited.to_dict("records") if hasattr(edited, "to_dict") else edited):
-               try:
-                   kind, day, s, en = row["Type"], row["Day"], row["Start"], row["End"]
-                   if kind not in new_c or day not in day_names or s is None or en is None:
-                       raise ValueError
-                   sm, em = planner.to_min(s), planner.to_min(en)
-                   if em <= sm:
-                       problems.append(f"{day} {kind}: the end must be after the start.")
-                       continue
-                   new_c[kind].append((day_names.index(day), sm, em))
-               except (KeyError, ValueError, AttributeError, TypeError):
-                   problems.append("A row is incomplete. Fill in every column or delete the row.")
-           if new_c["sleep"][0] == new_c["sleep"][1]:
-               problems.append("Bedtime and wake-up time cannot be the same.")
-           if problems:
-               for p in dict.fromkeys(problems):
-                   st.warning(p)
-           else:
-               save_commitments(email, new_c)
-               st.success("Saved. Press 'Build my study plan' on the other tab to use these times.")
-
-   with tab_plan:
-       st.caption("StudySpace fits study time for your upcoming tests and homework into the gaps in your week. "
-                  "You can also add your own blocks. You get an alert in the app about 10 minutes before each block starts "
-                  "(alerts show while StudySpace is open).")
-       if not saved:
-           st.info("Tip: open 'My weekly times' first and save your real sleep, school and sport times.")
-       st.button("Build my study plan", key="pl_build_btn", type="primary", on_click=_planner_build_cb, args=(email,))
-       msg = st.session_state.pop("pl_msg", None)
+   st.caption("StudySpace fits study time for your upcoming tests and homework into the free time in your week. "
+              "You can also add your own blocks. You get an alert in the app about 10 minutes before each block starts "
+              "(alerts show while StudySpace is open).")
+   msg = st.session_state.pop("pl_msg", None)
+   if st.session_state.get("pl_ask"):
        if msg:
            getattr(st, msg[0])(msg[1])
-       blocks = load_plan_blocks(email)
-       if blocks:
-           res = planner.count_conflicts([{"date": b["date"], "start": b["start"], "end": b["end"]} for b in blocks], c)
-           st.caption(f"Checked {res['total']} study blocks against your sleep, school and sport times: "
-                      f"{res['any']} clashes.")
-           last_day = None
-           for b in blocks:
-               if b["date"] != last_day:
-                   st.markdown(f"**{b['date'].strftime('%A %d %B')}**")
-                   last_day = b["date"]
-               r1, r2 = st.columns([6, 1])
-               tag = "your block" if b["source"] == "manual" else "auto"
-               r1.write(f"{planner.fmt(b['start'])} - {planner.fmt(b['end'])}  {b['title']}  ({tag})")
-               r2.button("Delete", key=f"pl_del_{b['id']}", on_click=_planner_delete_block_cb, args=(email, b["id"]))
-       else:
-           st.write("No study blocks yet.")
-       with st.expander("Add my own study block"):
-           with st.form("pl_add_form", clear_on_submit=False):
-               st.date_input("Date", _planner_today(), key="pl_new_date")
-               a1, a2 = st.columns(2)
-               a1.time_input("Start", datetime.time(17, 0), key="pl_new_start")
-               a2.time_input("End", datetime.time(18, 0), key="pl_new_end")
-               st.text_input("What are you studying?", key="pl_new_title")
-               st.form_submit_button("Add block", on_click=_planner_add_block_cb, args=(email,))
+       _planner_questions(email, c, saved)
+   else:
+       st.button("Build my study plan", key="pl_build_btn", type="primary", on_click=_planner_open_questions_cb)
+       if msg:
+           getattr(st, msg[0])(msg[1])
+   blocks = load_plan_blocks(email)
+   if blocks:
+       res = planner.count_conflicts([{"date": b["date"], "start": b["start"], "end": b["end"]} for b in blocks], c)
+       st.caption(f"Checked {res['total']} study blocks against your school and sport times and the study hours (after school, until 20:30): "
+                  f"{res['any']} clashes.")
+       last_day = None
+       for b in blocks:
+           if b["date"] != last_day:
+               st.markdown(f"**{b['date'].strftime('%A %d %B')}**")
+               last_day = b["date"]
+           r1, r2 = st.columns([6, 1])
+           tag = "your block" if b["source"] == "manual" else "auto"
+           r1.write(f"{planner.fmt(b['start'])} - {planner.fmt(b['end'])}  {b['title']}  ({tag})")
+           r2.button("Delete", key=f"pl_del_{b['id']}", on_click=_planner_delete_block_cb, args=(email, b["id"]))
+   else:
+       st.write("No study blocks yet. Press Build my study plan to get started.")
+   with st.expander("Add my own study block"):
+       with st.form("pl_add_form", clear_on_submit=False):
+           st.date_input("Date", _planner_today(), key="pl_new_date")
+           a1, a2 = st.columns(2)
+           a1.time_input("Start", datetime.time(17, 0), key="pl_new_start")
+           a2.time_input("End", datetime.time(18, 0), key="pl_new_end")
+           st.text_input("What are you studying?", key="pl_new_title")
+           st.form_submit_button("Add block", on_click=_planner_add_block_cb, args=(email,))
 
 
 # INITIALIZE APPLICATION COMPONENTS
@@ -4480,7 +4522,7 @@ PRIVACY_NOTICE_MD = f"""
 
 **What StudySpace stores about you**
 - **Account:** your name, email, whether you are a student or teacher, your grade, your main goal, your subjects and your study schedule.
-- **What you do in the app:** your chats with the AI tutor and any homework photos you upload, topics saved from your questions (you can switch this off in the sidebar), study logs, quiz results, reminders and a daily usage counter. If you use the Study Planner, also your sleep, school and sport times and your study plan.
+- **What you do in the app:** your chats with the AI tutor and any homework photos you upload, topics saved from your questions (you can switch this off in the sidebar), study logs, quiz results, reminders and a daily usage counter. If you use the Study Planner, also your school and sport times and your study plan.
 - **Classes:** the classes you create or join, join requests, homework and test dates. A teacher can see the name and email of students in their class.
 - **Staying logged in:** if you stay logged in, only a scrambled (hashed) token is stored, for up to 30 days. Login codes stop working after 10 minutes.
 
